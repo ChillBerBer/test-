@@ -1,0 +1,2909 @@
+(() => {
+  /* ============================================================
+     STEPP UP
+     ============================================================ */
+
+  if (window.__STEPPUp) {
+    try {
+      window.__STEPPUp.destroy();
+    } catch (_) {}
+  }
+
+  document.getElementById("stepp-up-widget")?.remove();
+
+
+  /* ============================================================
+     CONFIG
+     ============================================================ */
+
+  const CONFIG = {
+    interactionSelector: ".left-ui-bg",
+
+    seekSelector: "#seek",
+
+    progressSelector:
+      '#seek input[type="range"][data-ref="progressBar"]',
+
+    interactionRenderDelay: 400,
+
+    interactionResumeDelay: 1000,
+
+    seekProcessingDelay: 300,
+
+    scanInterval: 350,
+
+    interactionSearchAttempts: 12,
+
+    interactionSearchDelay: 200
+  };
+
+
+  /* ============================================================
+     STATE
+     ============================================================ */
+
+  let autoTimer = null;
+
+  let scannerTimer = null;
+
+  let clockTimer = null;
+
+  let observer = null;
+
+  let temporaryStatusTimer = null;
+
+  let autoRequested = false;
+
+  let interactionPaused = false;
+
+  let autoStepBusy = false;
+
+  let destroyed = false;
+
+  let presses = 0;
+
+  let muted = false;
+
+  let xDetected = false;
+
+  let temporaryStatus = "";
+
+  const handledInteractions =
+    new WeakSet();
+
+
+  /* ============================================================
+     HELPERS
+     ============================================================ */
+
+  const sleep = ms =>
+    new Promise(resolve =>
+      setTimeout(resolve, ms)
+    );
+
+
+  function getDocuments() {
+    const docs = [];
+
+    const seen =
+      new Set();
+
+
+    function walk(doc) {
+      if (
+        !doc ||
+        seen.has(doc)
+      ) {
+        return;
+      }
+
+      seen.add(doc);
+
+      docs.push(doc);
+
+
+      try {
+        doc
+          .querySelectorAll("iframe")
+          .forEach(frame => {
+
+            try {
+              if (frame.contentDocument) {
+                walk(
+                  frame.contentDocument
+                );
+              }
+            } catch (_) {}
+
+          });
+
+      } catch (_) {}
+    }
+
+
+    walk(document);
+
+    return docs;
+  }
+
+
+  function isVisible(element) {
+    if (!element) {
+      return false;
+    }
+
+    try {
+      const rect =
+        element.getBoundingClientRect();
+
+      const win =
+        element.ownerDocument
+          ?.defaultView ||
+        window;
+
+      const style =
+        win.getComputedStyle(
+          element
+        );
+
+
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        Number(style.opacity || 1) > 0
+      );
+
+    } catch (_) {
+      return false;
+    }
+  }
+
+
+  /* ============================================================
+     KEYBOARD EVENTS
+     ============================================================ */
+
+  function makeKeyEvent(
+    type,
+    key,
+    code,
+    keyCode
+  ) {
+    const event =
+      new KeyboardEvent(
+        type,
+        {
+          key,
+          code,
+
+          // Control
+          ctrlKey: true,
+
+          // Option
+          altKey: true,
+
+          shiftKey: false,
+
+          metaKey: false,
+
+          bubbles: true,
+
+          cancelable: true,
+
+          composed: true
+        }
+      );
+
+
+    try {
+      Object.defineProperty(
+        event,
+        "keyCode",
+        {
+          get: () =>
+            keyCode
+        }
+      );
+
+
+      Object.defineProperty(
+        event,
+        "which",
+        {
+          get: () =>
+            keyCode
+        }
+      );
+
+    } catch (_) {}
+
+
+    return event;
+  }
+
+
+  function sendShortcut(
+    key,
+    code,
+    keyCode
+  ) {
+    getDocuments()
+      .forEach(doc => {
+
+        const targets = [
+          doc.activeElement,
+          doc.body,
+          doc.documentElement,
+          doc
+        ].filter(Boolean);
+
+
+        targets.forEach(target => {
+
+          try {
+            target.dispatchEvent(
+              makeKeyEvent(
+                "keydown",
+                key,
+                code,
+                keyCode
+              )
+            );
+          } catch (_) {}
+
+        });
+
+
+        try {
+          doc.defaultView
+            ?.dispatchEvent(
+              makeKeyEvent(
+                "keydown",
+                key,
+                code,
+                keyCode
+              )
+            );
+        } catch (_) {}
+
+
+        setTimeout(
+          () => {
+
+            targets.forEach(
+              target => {
+
+                try {
+                  target.dispatchEvent(
+                    makeKeyEvent(
+                      "keyup",
+                      key,
+                      code,
+                      keyCode
+                    )
+                  );
+                } catch (_) {}
+
+              }
+            );
+
+
+            try {
+              doc.defaultView
+                ?.dispatchEvent(
+                  makeKeyEvent(
+                    "keyup",
+                    key,
+                    code,
+                    keyCode
+                  )
+                );
+            } catch (_) {}
+
+          },
+
+          35
+        );
+      });
+  }
+
+
+  /* ============================================================
+     WIDGET
+     ============================================================ */
+
+  const host =
+    document.createElement(
+      "div"
+    );
+
+
+  host.id =
+    "stepp-up-widget";
+
+
+  host.style.cssText = `
+    all: initial;
+
+    position: fixed;
+
+    top: 80px;
+    right: 28px;
+
+    z-index: 2147483647;
+
+    font-family:
+      -apple-system,
+      BlinkMacSystemFont,
+      "SF Pro Display",
+      "SF Pro Text",
+      "Helvetica Neue",
+      Helvetica,
+      Arial,
+      sans-serif;
+  `;
+
+
+  const shadow =
+    host.attachShadow({
+      mode: "open"
+    });
+
+
+  shadow.innerHTML = `
+
+    <style>
+
+      * {
+        box-sizing: border-box;
+      }
+
+
+      .glass {
+        position: relative;
+
+        width: 350px;
+
+        overflow: hidden;
+
+        border-radius: 30px;
+
+        color: white;
+
+
+        background:
+
+          radial-gradient(
+            230px 160px
+            at 5% -5%,
+            rgba(255,255,255,.18),
+            transparent 70%
+          ),
+
+          radial-gradient(
+            180px 130px
+            at 100% 100%,
+            rgba(100,130,255,.08),
+            transparent 75%
+          ),
+
+          linear-gradient(
+            145deg,
+            rgba(46,46,52,.82),
+            rgba(11,11,15,.78)
+          );
+
+
+        border:
+          1px solid
+          rgba(255,255,255,.18);
+
+
+        backdrop-filter:
+          blur(40px)
+          saturate(190%);
+
+
+        -webkit-backdrop-filter:
+          blur(40px)
+          saturate(190%);
+
+
+        box-shadow:
+
+          0 35px 90px
+          rgba(0,0,0,.48),
+
+          inset 0 1px 0
+          rgba(255,255,255,.22);
+
+
+        user-select: none;
+      }
+
+
+
+      .header {
+
+        display: flex;
+
+        align-items: center;
+
+        justify-content: space-between;
+
+        padding:
+          18px
+          18px
+          14px;
+
+        cursor: grab;
+      }
+
+
+      .header:active {
+        cursor: grabbing;
+      }
+
+
+      .title {
+
+        font-size: 19px;
+
+        font-weight: 700;
+
+        letter-spacing:
+          -.45px;
+      }
+
+
+      .subtitle {
+
+        margin-top: 2px;
+
+        font-size: 10.5px;
+
+        color:
+          rgba(255,255,255,.47);
+      }
+
+
+      .close {
+
+        appearance: none;
+        -webkit-appearance: none;
+
+        width: 29px;
+        height: 29px;
+
+        border: none;
+
+        border-radius: 50%;
+
+        background:
+          rgba(255,255,255,.09);
+
+        color:
+          rgba(255,255,255,.82);
+
+        font-size: 18px;
+
+        cursor: pointer;
+      }
+
+
+      .content {
+
+        padding:
+          0
+          17px
+          18px;
+      }
+
+
+      /* =========================
+         TOP CARDS
+         ========================= */
+
+      .topGrid {
+
+        display: grid;
+
+        grid-template-columns:
+          1fr 1fr;
+
+        gap: 11px;
+
+        margin-bottom: 14px;
+      }
+
+
+      .card {
+
+        height: 122px;
+
+        border-radius: 23px;
+
+        border:
+          1px solid
+          rgba(255,255,255,.13);
+
+        background:
+          linear-gradient(
+            145deg,
+            rgba(255,255,255,.12),
+            rgba(255,255,255,.045)
+          );
+
+        box-shadow:
+          inset 0 1px 0
+          rgba(255,255,255,.12);
+
+        color: white;
+      }
+
+
+      /* =========================
+         ANALOG CLOCK
+         ========================= */
+
+      .clockCard {
+
+        display: flex;
+
+        align-items: center;
+
+        justify-content: center;
+      }
+
+
+      .clock {
+
+        position: relative;
+
+        width: 88px;
+
+        height: 88px;
+
+        border-radius: 50%;
+
+        border:
+          1px solid
+          rgba(255,255,255,.25);
+
+        background:
+          radial-gradient(
+            circle,
+            rgba(255,255,255,.08),
+            rgba(0,0,0,.10)
+          );
+
+        box-shadow:
+
+          inset 0 1px 2px
+          rgba(255,255,255,.15),
+
+          0 7px 18px
+          rgba(0,0,0,.20);
+      }
+
+
+      .tick {
+
+        position: absolute;
+
+        left: 50%;
+
+        top: 5px;
+
+        width: 1px;
+
+        height: 5px;
+
+        background:
+          rgba(255,255,255,.55);
+
+        transform-origin:
+          0 39px;
+      }
+
+
+      .hand {
+
+        position: absolute;
+
+        left: 50%;
+
+        bottom: 50%;
+
+        transform-origin:
+          50% 100%;
+
+        border-radius: 10px;
+      }
+
+
+      .hourHand {
+
+        width: 3px;
+
+        height: 22px;
+
+        margin-left:
+          -1.5px;
+
+        background:
+          rgba(255,255,255,.95);
+      }
+
+
+      .minuteHand {
+
+        width: 2px;
+
+        height: 31px;
+
+        margin-left:
+          -1px;
+
+        background:
+          rgba(255,255,255,.92);
+      }
+
+
+      .secondHand {
+
+        width: 1.5px;
+
+        height: 34px;
+
+        margin-left:
+          -.75px;
+
+        background:
+          #ff453a;
+      }
+
+
+      .clockCenter {
+
+        position: absolute;
+
+        left: 50%;
+
+        top: 50%;
+
+        width: 7px;
+
+        height: 7px;
+
+        transform:
+          translate(-50%,-50%);
+
+        border-radius: 50%;
+
+        background:
+          #ff453a;
+
+        box-shadow:
+          0 0 7px
+          rgba(255,69,58,.8);
+      }
+
+
+      /* =========================
+         MUTE
+         ========================= */
+
+      .muteButton {
+
+        appearance: none;
+        -webkit-appearance: none;
+
+        cursor: pointer;
+
+        transition:
+          transform .15s ease,
+          background .15s ease;
+      }
+
+
+      .muteButton:hover {
+
+        transform:
+          translateY(-2px);
+
+        background:
+          rgba(255,255,255,.15);
+      }
+
+
+      .muteButton:active {
+
+        transform:
+          scale(.96);
+      }
+
+
+      .muteInner {
+
+        height: 100%;
+
+        display: flex;
+
+        flex-direction: column;
+
+        align-items: center;
+
+        justify-content: center;
+      }
+
+
+      .muteIcon {
+
+        margin-bottom: 8px;
+
+        font-size: 31px;
+      }
+
+
+      .muteState {
+
+        font-size: 13px;
+
+        font-weight: 650;
+      }
+
+
+      .muteKeys {
+
+        margin-top: 4px;
+
+        font-size: 9px;
+
+        color:
+          rgba(255,255,255,.43);
+      }
+
+
+      /* =========================
+         STATUS PANEL
+         ========================= */
+
+      .panel {
+
+        padding: 15px;
+
+        border-radius: 21px;
+
+        border:
+          1px solid
+          rgba(255,255,255,.10);
+
+        background:
+          rgba(255,255,255,.052);
+
+        box-shadow:
+          inset 0 1px 0
+          rgba(255,255,255,.07);
+      }
+
+
+      .statusTop {
+
+        display: flex;
+
+        align-items: center;
+
+        justify-content: space-between;
+
+        gap: 10px;
+
+        margin-bottom: 6px;
+      }
+
+
+      .statusTitle {
+
+        font-size: 12px;
+
+        font-weight: 700;
+      }
+
+
+      .seconds {
+
+        flex: 0 0 auto;
+
+        font-size: 11px;
+
+        font-variant-numeric:
+          tabular-nums;
+
+        color:
+          rgba(255,255,255,.64);
+      }
+
+
+      .statusLine {
+
+        min-height: 18px;
+
+        margin-bottom: 10px;
+
+        display: flex;
+
+        align-items: center;
+
+        gap: 7px;
+
+        font-size: 10px;
+
+        color:
+          rgba(255,255,255,.55);
+      }
+
+
+      .dot {
+
+        width: 6px;
+
+        height: 6px;
+
+        flex:
+          0 0 auto;
+
+        border-radius: 50%;
+
+        background:
+          rgba(255,255,255,.28);
+      }
+
+
+      .dot.running {
+
+        background:
+          #5cff83;
+
+        box-shadow:
+          0 0 9px
+          rgba(92,255,131,.8);
+      }
+
+
+      .dot.paused {
+
+        background:
+          #ffd55c;
+
+        box-shadow:
+          0 0 9px
+          rgba(255,213,92,.8);
+      }
+
+
+      .dot.processing {
+
+        background:
+          #73baff;
+
+        box-shadow:
+          0 0 9px
+          rgba(115,186,255,.8);
+      }
+
+
+      .dot.x {
+
+        background:
+          #ff9f0a;
+
+        box-shadow:
+          0 0 9px
+          rgba(255,159,10,.85);
+      }
+
+
+      /* =========================
+         SPEED SLIDER
+         ========================= */
+
+      input[type="range"] {
+
+        appearance: none;
+        -webkit-appearance: none;
+
+        width: 100%;
+
+        height: 6px;
+
+        border-radius: 999px;
+
+        outline: none;
+
+        cursor: pointer;
+
+
+        background:
+
+          linear-gradient(
+            90deg,
+
+            rgba(255,255,255,.96)
+            var(--fill,20%),
+
+            rgba(255,255,255,.16)
+            var(--fill,20%)
+          );
+      }
+
+
+      input[type="range"]::-webkit-slider-thumb {
+
+        appearance: none;
+        -webkit-appearance: none;
+
+        width: 21px;
+
+        height: 21px;
+
+        border-radius: 50%;
+
+        background:
+          white;
+
+        box-shadow:
+          0 2px 8px
+          rgba(0,0,0,.42);
+      }
+
+
+      .scale {
+
+        display: flex;
+
+        justify-content: space-between;
+
+        margin-top: 8px;
+
+        margin-bottom: 14px;
+
+        font-size: 8px;
+
+        color:
+          rgba(255,255,255,.29);
+      }
+
+
+      /* =========================
+         PLAY / PAUSE
+         ========================= */
+
+      .playPause {
+
+        appearance: none;
+        -webkit-appearance: none;
+
+        width: 100%;
+
+        height: 47px;
+
+        display: flex;
+
+        align-items: center;
+
+        justify-content: center;
+
+        border-radius: 16px;
+
+        border:
+          1px solid
+          rgba(255,255,255,.13);
+
+        background:
+          rgba(255,255,255,.09);
+
+        color: white;
+
+        font-size: 22px;
+
+        cursor: pointer;
+
+        transition:
+          transform .15s ease,
+          background .15s ease;
+      }
+
+
+      .playPause:hover {
+
+        background:
+          rgba(255,255,255,.15);
+      }
+
+
+      .playPause:active {
+
+        transform:
+          scale(.98);
+      }
+
+
+      .playPause.running {
+
+        background:
+          rgba(255,255,255,.13);
+      }
+
+
+      /* =========================
+         DIGITAL CLOCK
+         ========================= */
+
+      .digital {
+
+        margin-top: 13px;
+
+        padding-top: 12px;
+
+        border-top:
+          1px solid
+          rgba(255,255,255,.08);
+
+        text-align: center;
+      }
+
+
+      .digitalTime {
+
+        font-size: 22px;
+
+        font-weight: 600;
+
+        letter-spacing:
+          -.4px;
+
+        font-variant-numeric:
+          tabular-nums;
+      }
+
+
+      .digitalDate {
+
+        margin-top: 3px;
+
+        font-size: 10px;
+
+        color:
+          rgba(255,255,255,.45);
+      }
+
+    </style>
+
+
+    <div class="glass">
+
+      <div
+        class="header"
+        id="drag"
+      >
+
+        <div>
+
+          <div class="title">
+            STEPP Up
+          </div>
+
+          <div class="subtitle">
+            Clippy here to help
+          </div>
+
+        </div>
+
+
+        <button
+          class="close"
+          id="close"
+        >
+          ×
+        </button>
+
+      </div>
+
+
+      <div class="content">
+
+
+        <div class="topGrid">
+
+
+          <div
+            class="card clockCard"
+          >
+
+            <div
+              class="clock"
+              id="clock"
+            >
+
+              <div
+                class="hand hourHand"
+                id="hourHand"
+              ></div>
+
+              <div
+                class="hand minuteHand"
+                id="minuteHand"
+              ></div>
+
+              <div
+                class="hand secondHand"
+                id="secondHand"
+              ></div>
+
+              <div
+                class="clockCenter"
+              ></div>
+
+            </div>
+
+          </div>
+
+
+          <button
+            class="card muteButton"
+            id="muteButton"
+          >
+
+            <div class="muteInner">
+
+              <div
+                class="muteIcon"
+                id="muteIcon"
+              >
+                🔊
+              </div>
+
+              <div
+                class="muteState"
+                id="muteState"
+              >
+                Unmuted
+              </div>
+
+              <div class="muteKeys">
+                ⌃ + ⌥ + M
+              </div>
+
+            </div>
+
+          </button>
+
+
+        </div>
+
+
+        <div class="panel">
+
+
+          <div class="statusTop">
+
+            <div class="statusTitle">
+              Status
+            </div>
+
+            <div
+              class="seconds"
+              id="seconds"
+            >
+              1.5 sec
+            </div>
+
+          </div>
+
+
+          <div class="statusLine">
+
+            <span
+              class="dot"
+              id="dot"
+            ></span>
+
+            <span
+              id="statusText"
+            >
+              Ready
+            </span>
+
+          </div>
+
+
+          <input
+            id="speed"
+            type="range"
+
+            min="500"
+            max="5000"
+
+            step="100"
+
+            value="1500"
+          >
+
+
+          <div class="scale">
+
+            <span>
+              FAST
+            </span>
+
+            <span>
+              SLOW
+            </span>
+
+          </div>
+
+
+          <button
+            class="playPause"
+            id="playPause"
+            title="Start Auto NEXT"
+          >
+            ▶
+          </button>
+
+
+          <div class="digital">
+
+            <div
+              class="digitalTime"
+              id="digitalTime"
+            >
+              --:--:--
+            </div>
+
+            <div
+              class="digitalDate"
+              id="digitalDate"
+            >
+              ----
+            </div>
+
+          </div>
+
+
+        </div>
+
+
+      </div>
+
+    </div>
+  `;
+
+
+  document
+    .documentElement
+    .appendChild(host);
+
+
+  /* ============================================================
+     ELEMENTS
+     ============================================================ */
+
+  const $ =
+    id =>
+      shadow.getElementById(id);
+
+
+  const speed =
+    $("speed");
+
+  const secondsDisplay =
+    $("seconds");
+
+  const statusText =
+    $("statusText");
+
+  const dot =
+    $("dot");
+
+  const playPause =
+    $("playPause");
+
+  const muteButton =
+    $("muteButton");
+
+  const muteIcon =
+    $("muteIcon");
+
+  const muteState =
+    $("muteState");
+
+  const digitalTime =
+    $("digitalTime");
+
+  const digitalDate =
+    $("digitalDate");
+
+  const hourHand =
+    $("hourHand");
+
+  const minuteHand =
+    $("minuteHand");
+
+  const secondHand =
+    $("secondHand");
+
+
+  /* ============================================================
+     CLOCK TICKS
+     ============================================================ */
+
+  const clock =
+    $("clock");
+
+
+  for (
+    let i = 0;
+    i < 12;
+    i++
+  ) {
+
+    const tick =
+      document.createElement(
+        "div"
+      );
+
+    tick.className =
+      "tick";
+
+    tick.style.transform =
+      `translateX(-50%) rotate(${i * 30}deg)`;
+
+    clock.appendChild(
+      tick
+    );
+  }
+
+
+  /* ============================================================
+     LIVE CLOCK / DATE
+     ============================================================ */
+
+  function updateClock() {
+
+    const now =
+      new Date();
+
+
+    const hours =
+      now.getHours() % 12;
+
+
+    const minutes =
+      now.getMinutes();
+
+
+    const seconds =
+      now.getSeconds();
+
+
+    const milliseconds =
+      now.getMilliseconds();
+
+
+    const secondDegrees =
+      (
+        seconds +
+        milliseconds / 1000
+      ) * 6;
+
+
+    const minuteDegrees =
+      (
+        minutes +
+        seconds / 60
+      ) * 6;
+
+
+    const hourDegrees =
+      (
+        hours +
+        minutes / 60
+      ) * 30;
+
+
+    hourHand.style.transform =
+      `rotate(${hourDegrees}deg)`;
+
+
+    minuteHand.style.transform =
+      `rotate(${minuteDegrees}deg)`;
+
+
+    secondHand.style.transform =
+      `rotate(${secondDegrees}deg)`;
+
+
+    digitalTime.textContent =
+      now.toLocaleTimeString(
+        [],
+        {
+          hour:
+            "2-digit",
+
+          minute:
+            "2-digit",
+
+          second:
+            "2-digit"
+        }
+      );
+
+
+    digitalDate.textContent =
+      now.toLocaleDateString(
+        [],
+        {
+          weekday:
+            "long",
+
+          month:
+            "long",
+
+          day:
+            "numeric",
+
+          year:
+            "numeric"
+        }
+      );
+  }
+
+
+  updateClock();
+
+
+  clockTimer =
+    setInterval(
+      updateClock,
+      250
+    );
+
+
+  /* ============================================================
+     STATUS
+     ============================================================ */
+
+  function setTemporaryStatus(
+    text,
+    duration = 1200
+  ) {
+
+    temporaryStatus =
+      text;
+
+
+    renderStatus();
+
+
+    if (temporaryStatusTimer) {
+
+      clearTimeout(
+        temporaryStatusTimer
+      );
+    }
+
+
+    temporaryStatusTimer =
+      setTimeout(
+        () => {
+
+          temporaryStatus =
+            "";
+
+          renderStatus();
+
+        },
+
+        duration
+      );
+  }
+
+
+  function renderStatus() {
+
+    dot.className =
+      "dot";
+
+
+    if (temporaryStatus) {
+
+      statusText.textContent =
+        temporaryStatus;
+
+      dot.classList.add(
+        "processing"
+      );
+
+      return;
+    }
+
+
+    if (interactionPaused) {
+
+      statusText.textContent =
+        xDetected
+          ? "X detected • Paused"
+          : "Interaction detected • Paused";
+
+
+      dot.classList.add(
+        xDetected
+          ? "x"
+          : "paused"
+      );
+
+      return;
+    }
+
+
+    if (xDetected) {
+
+      statusText.textContent =
+        "X detected on page";
+
+
+      dot.classList.add(
+        "x"
+      );
+
+      return;
+    }
+
+
+    if (autoRequested) {
+
+      statusText.textContent =
+        autoStepBusy
+          ? "Processing…"
+          : `Running • ${presses} NEXT`;
+
+
+      dot.classList.add(
+        autoStepBusy
+          ? "processing"
+          : "running"
+      );
+
+      return;
+    }
+
+
+    statusText.textContent =
+      "Ready";
+  }
+
+
+  /* ============================================================
+     DETECT X ON PAGE
+     ============================================================ */
+
+  function detectXOnPage() {
+
+    let found =
+      false;
+
+
+    getDocuments()
+      .some(doc => {
+
+        try {
+
+          const elements =
+            doc.querySelectorAll(`
+              button,
+              [role="button"],
+              [aria-label],
+              [title],
+              [data-acc-text]
+            `);
+
+
+          for (
+            const element
+            of elements
+          ) {
+
+            if (
+              !isVisible(element)
+            ) {
+              continue;
+            }
+
+
+            const values = [
+
+              element.textContent,
+
+              element.getAttribute(
+                "aria-label"
+              ),
+
+              element.getAttribute(
+                "title"
+              ),
+
+              element.getAttribute(
+                "data-acc-text"
+              )
+
+            ]
+              .filter(Boolean)
+
+              .map(value =>
+                value
+                  .trim()
+                  .toLowerCase()
+              );
+
+
+            const match =
+              values.some(value =>
+                value === "x" ||
+                value === "×" ||
+                value === "close" ||
+                value === "close button"
+              );
+
+
+            if (match) {
+
+              found =
+                true;
+
+              break;
+            }
+          }
+
+
+          return found;
+
+        } catch (_) {
+
+          return false;
+        }
+
+      });
+
+
+    xDetected =
+      found;
+
+
+    return found;
+  }
+
+
+  /* ============================================================
+     NEXT
+     ============================================================ */
+
+  function nextScreen() {
+
+    sendShortcut(
+      ".",
+      "Period",
+      190
+    );
+  }
+
+
+  /* ============================================================
+     MUTE
+     ============================================================ */
+
+  function toggleMute() {
+
+    sendShortcut(
+      "m",
+      "KeyM",
+      77
+    );
+
+
+    muted =
+      !muted;
+
+
+    if (muted) {
+
+      muteIcon.textContent =
+        "🔇";
+
+      muteState.textContent =
+        "Muted";
+
+      setTemporaryStatus(
+        "Sound muted"
+      );
+
+    } else {
+
+      muteIcon.textContent =
+        "🔊";
+
+      muteState.textContent =
+        "Unmuted";
+
+      setTemporaryStatus(
+        "Sound unmuted"
+      );
+    }
+  }
+
+
+  muteButton
+    .addEventListener(
+      "click",
+      toggleMute
+    );
+
+
+  /* ============================================================
+     SEEK TO END
+     ============================================================ */
+
+  function forceSeekToEnd() {
+
+    let found =
+      false;
+
+
+    getDocuments()
+      .forEach(doc => {
+
+        try {
+
+          const seek =
+            doc.querySelector(
+              CONFIG.seekSelector
+            );
+
+
+          const range =
+            doc.querySelector(
+              CONFIG.progressSelector
+            );
+
+
+          if (
+            !seek ||
+            !range ||
+            !isVisible(seek)
+          ) {
+            return;
+          }
+
+
+          found =
+            true;
+
+
+          /*
+            Range input → maximum
+          */
+
+          const max =
+            Number(
+              range.max
+            );
+
+
+          if (
+            Number.isFinite(max)
+          ) {
+
+            range.value =
+              String(max);
+
+
+            range.dispatchEvent(
+              new Event(
+                "input",
+                {
+                  bubbles: true
+                }
+              )
+            );
+
+
+            range.dispatchEvent(
+              new Event(
+                "change",
+                {
+                  bubbles: true
+                }
+              )
+            );
+          }
+
+
+          /*
+            Left click at far right.
+          */
+
+          const rect =
+            seek.getBoundingClientRect();
+
+
+          const x =
+            rect.right - 3;
+
+
+          const y =
+            rect.top +
+            rect.height / 2;
+
+
+          const target =
+            doc.elementFromPoint(
+              x,
+              y
+            ) ||
+            range;
+
+
+          const view =
+            doc.defaultView ||
+            window;
+
+
+          const down = {
+
+            bubbles: true,
+
+            cancelable: true,
+
+            clientX: x,
+
+            clientY: y,
+
+            button: 0,
+
+            buttons: 1,
+
+            view
+          };
+
+
+          const up = {
+
+            ...down,
+
+            buttons: 0
+          };
+
+
+          target.dispatchEvent(
+            new MouseEvent(
+              "mousemove",
+              down
+            )
+          );
+
+
+          target.dispatchEvent(
+            new MouseEvent(
+              "mousedown",
+              down
+            )
+          );
+
+
+          target.dispatchEvent(
+            new MouseEvent(
+              "mouseup",
+              up
+            )
+          );
+
+
+          target.dispatchEvent(
+            new MouseEvent(
+              "click",
+              up
+            )
+          );
+
+
+        } catch (error) {
+
+          console.warn(
+            "[STEPP Up] Seek failed:",
+            error
+          );
+        }
+
+      });
+
+
+    return found;
+  }
+
+
+  /* ============================================================
+     AUTO TIMER
+     ============================================================ */
+
+  function clearAutoTimer() {
+
+    if (autoTimer) {
+
+      clearInterval(
+        autoTimer
+      );
+
+      autoTimer =
+        null;
+    }
+  }
+
+
+  /* ============================================================
+     AUTO NEXT STEP
+     ============================================================ */
+
+  async function runAutoNextStep() {
+
+    if (
+      destroyed ||
+      !autoRequested ||
+      interactionPaused ||
+      autoStepBusy
+    ) {
+      return;
+    }
+
+
+    autoStepBusy =
+      true;
+
+
+    renderStatus();
+
+
+    try {
+
+      scanInteractions();
+
+
+      if (
+        interactionPaused
+      ) {
+        return;
+      }
+
+
+      forceSeekToEnd();
+
+
+      await sleep(
+        CONFIG.seekProcessingDelay
+      );
+
+
+      scanInteractions();
+
+
+      if (
+        destroyed ||
+        !autoRequested ||
+        interactionPaused
+      ) {
+        return;
+      }
+
+
+      nextScreen();
+
+
+      presses++;
+
+
+    } finally {
+
+      autoStepBusy =
+        false;
+
+
+      renderStatus();
+    }
+  }
+
+
+  function buildAutoTimer() {
+
+    clearAutoTimer();
+
+
+    if (
+      !autoRequested ||
+      interactionPaused ||
+      destroyed
+    ) {
+      return;
+    }
+
+
+    autoTimer =
+      setInterval(
+        runAutoNextStep,
+        Number(
+          speed.value
+        )
+      );
+  }
+
+
+  /* ============================================================
+     START / PAUSE
+     ============================================================ */
+
+  async function startAuto() {
+
+    if (
+      autoRequested ||
+      destroyed
+    ) {
+      return;
+    }
+
+
+    autoRequested =
+      true;
+
+
+    interactionPaused =
+      false;
+
+
+    playPause.textContent =
+      "⏸";
+
+
+    playPause.title =
+      "Pause Auto NEXT";
+
+
+    playPause.classList
+      .add("running");
+
+
+    renderStatus();
+
+
+    await runAutoNextStep();
+
+
+    if (
+      autoRequested &&
+      !interactionPaused
+    ) {
+
+      buildAutoTimer();
+    }
+  }
+
+
+  function pauseAuto() {
+
+    autoRequested =
+      false;
+
+
+    clearAutoTimer();
+
+
+    playPause.textContent =
+      "▶";
+
+
+    playPause.title =
+      "Start Auto NEXT";
+
+
+    playPause.classList
+      .remove("running");
+
+
+    renderStatus();
+  }
+
+
+  playPause
+    .addEventListener(
+      "click",
+      () => {
+
+        if (autoRequested) {
+
+          pauseAuto();
+
+        } else {
+
+          startAuto();
+        }
+      }
+    );
+
+
+  /* ============================================================
+     SPEED
+     ============================================================ */
+
+  function updateSpeed() {
+
+    const ms =
+      Number(
+        speed.value
+      );
+
+
+    /*
+      Seconds information ALWAYS remains.
+    */
+
+    secondsDisplay.textContent =
+      `${(ms / 1000).toFixed(1)} sec`;
+
+
+    const progress =
+      (
+        (
+          ms -
+          Number(speed.min)
+        )
+
+        /
+
+        (
+          Number(speed.max) -
+          Number(speed.min)
+        )
+      )
+
+      * 100;
+
+
+    speed.style
+      .setProperty(
+        "--fill",
+        `${progress}%`
+      );
+
+
+    if (
+      autoRequested &&
+      !interactionPaused
+    ) {
+
+      buildAutoTimer();
+    }
+  }
+
+
+  speed
+    .addEventListener(
+      "input",
+      updateSpeed
+    );
+
+
+  /* ============================================================
+     FIND INTERACTION CONTROL
+     ============================================================ */
+
+  function findAssociatedControl(
+    bg
+  ) {
+
+    if (!bg) {
+      return null;
+    }
+
+
+    const selector = [
+
+      "button",
+
+      "[role='button']",
+
+      "a[href]",
+
+      "[onclick]",
+
+      "[tabindex='0']",
+
+      "[data-acc-text]",
+
+      "[data-ref]",
+
+      ".slide-object"
+
+    ].join(",");
+
+
+    try {
+
+      const closest =
+        bg.closest(
+          selector
+        );
+
+
+      if (
+        closest &&
+        closest !== bg &&
+        isVisible(closest)
+      ) {
+
+        return closest;
+      }
+
+    } catch (_) {}
+
+
+    let container =
+      bg;
+
+
+    for (
+      let level = 0;
+
+      level < 10 &&
+      container;
+
+      level++
+    ) {
+
+      container =
+        container.parentElement;
+
+
+      if (!container) {
+        break;
+      }
+
+
+      try {
+
+        if (
+          container.matches(
+            selector
+          ) &&
+          isVisible(container)
+        ) {
+
+          return container;
+        }
+
+      } catch (_) {}
+
+
+      try {
+
+        const candidates =
+          [
+            ...container
+              .querySelectorAll(
+                selector
+              )
+          ];
+
+
+        const candidate =
+          candidates.find(
+            item =>
+              item !== bg &&
+              isVisible(item)
+          );
+
+
+        if (candidate) {
+
+          return candidate;
+        }
+
+      } catch (_) {}
+    }
+
+
+    return null;
+  }
+
+
+  /* ============================================================
+     LEFT CLICK
+     ============================================================ */
+
+  function simulateLeftClick(
+    element
+  ) {
+
+    if (!element) {
+      return false;
+    }
+
+
+    try {
+
+      const rect =
+        element.getBoundingClientRect();
+
+
+      const x =
+        rect.left +
+        rect.width / 2;
+
+
+      const y =
+        rect.top +
+        rect.height / 2;
+
+
+      const win =
+        element.ownerDocument
+          ?.defaultView ||
+        window;
+
+
+      const down = {
+
+        bubbles: true,
+
+        cancelable: true,
+
+        clientX: x,
+
+        clientY: y,
+
+        button: 0,
+
+        buttons: 1,
+
+        view: win
+      };
+
+
+      const up = {
+
+        ...down,
+
+        buttons: 0
+      };
+
+
+      element.dispatchEvent(
+        new MouseEvent(
+          "mouseover",
+          down
+        )
+      );
+
+
+      element.dispatchEvent(
+        new MouseEvent(
+          "mousedown",
+          down
+        )
+      );
+
+
+      element.dispatchEvent(
+        new MouseEvent(
+          "mouseup",
+          up
+        )
+      );
+
+
+      element.dispatchEvent(
+        new MouseEvent(
+          "click",
+          up
+        )
+      );
+
+
+      return true;
+
+    } catch (error) {
+
+      console.warn(
+        "[STEPP Up] Interaction click failed:",
+        error
+      );
+
+
+      return false;
+    }
+  }
+
+
+  /* ============================================================
+     INTERACTION PROCESSING
+     ============================================================ */
+
+  async function processInteraction(
+    bg
+  ) {
+
+    if (
+      destroyed ||
+      handledInteractions.has(bg) ||
+      !isVisible(bg)
+    ) {
+      return;
+    }
+
+
+    handledInteractions.add(
+      bg
+    );
+
+
+    const resumeAfter =
+      autoRequested;
+
+
+    if (resumeAfter) {
+
+      interactionPaused =
+        true;
+
+
+      clearAutoTimer();
+
+
+      renderStatus();
+    }
+
+
+    await sleep(
+      CONFIG.interactionRenderDelay
+    );
+
+
+    let control =
+      null;
+
+
+    for (
+      let attempt = 0;
+
+      attempt <
+      CONFIG.interactionSearchAttempts;
+
+      attempt++
+    ) {
+
+      control =
+        findAssociatedControl(
+          bg
+        );
+
+
+      if (control) {
+        break;
+      }
+
+
+      await sleep(
+        CONFIG.interactionSearchDelay
+      );
+    }
+
+
+    if (!control) {
+
+      interactionPaused =
+        resumeAfter;
+
+
+      renderStatus();
+
+
+      return;
+    }
+
+
+    setTemporaryStatus(
+      "Selecting interaction…",
+      900
+    );
+
+
+    const success =
+      simulateLeftClick(
+        control
+      );
+
+
+    if (!success) {
+
+      interactionPaused =
+        resumeAfter;
+
+
+      renderStatus();
+
+
+      return;
+    }
+
+
+    await sleep(
+      CONFIG.interactionResumeDelay
+    );
+
+
+    if (
+      resumeAfter &&
+      !destroyed
+    ) {
+
+      interactionPaused =
+        false;
+
+
+      renderStatus();
+
+
+      buildAutoTimer();
+    }
+  }
+
+
+  /* ============================================================
+     SCAN
+     ============================================================ */
+
+  function scanInteractions() {
+
+    if (destroyed) {
+      return false;
+    }
+
+
+    detectXOnPage();
+
+
+    let interactionFound =
+      false;
+
+
+    getDocuments()
+      .forEach(doc => {
+
+        try {
+
+          doc
+            .querySelectorAll(
+              CONFIG.interactionSelector
+            )
+            .forEach(bg => {
+
+              if (
+                isVisible(bg) &&
+                !handledInteractions.has(bg)
+              ) {
+
+                interactionFound =
+                  true;
+
+
+                processInteraction(
+                  bg
+                );
+              }
+
+            });
+
+        } catch (_) {}
+
+      });
+
+
+    renderStatus();
+
+
+    return interactionFound;
+  }
+
+
+  /* ============================================================
+     OBSERVER
+     ============================================================ */
+
+  observer =
+    new MutationObserver(
+      scanInteractions
+    );
+
+
+  observer.observe(
+    document.documentElement,
+    {
+      childList: true,
+
+      subtree: true,
+
+      attributes: true,
+
+      attributeFilter: [
+        "class",
+        "style",
+        "hidden",
+        "aria-hidden"
+      ]
+    }
+  );
+
+
+  scannerTimer =
+    setInterval(
+      scanInteractions,
+      CONFIG.scanInterval
+    );
+
+
+  /* ============================================================
+     DRAG
+     ============================================================ */
+
+  const drag =
+    $("drag");
+
+
+  let dragging =
+    false;
+
+
+  let offsetX =
+    0;
+
+
+  let offsetY =
+    0;
+
+
+  drag.addEventListener(
+    "pointerdown",
+    event => {
+
+      if (
+        event.target.closest(
+          "button"
+        )
+      ) {
+        return;
+      }
+
+
+      dragging =
+        true;
+
+
+      const rect =
+        host
+          .getBoundingClientRect();
+
+
+      offsetX =
+        event.clientX -
+        rect.left;
+
+
+      offsetY =
+        event.clientY -
+        rect.top;
+
+
+      try {
+
+        drag.setPointerCapture(
+          event.pointerId
+        );
+
+      } catch (_) {}
+    }
+  );
+
+
+  drag.addEventListener(
+    "pointermove",
+    event => {
+
+      if (!dragging) {
+        return;
+      }
+
+
+      const x =
+        Math.max(
+          0,
+          Math.min(
+            window.innerWidth -
+            host.offsetWidth,
+
+            event.clientX -
+            offsetX
+          )
+        );
+
+
+      const y =
+        Math.max(
+          0,
+          Math.min(
+            window.innerHeight -
+            host.offsetHeight,
+
+            event.clientY -
+            offsetY
+          )
+        );
+
+
+      host.style.left =
+        `${x}px`;
+
+
+      host.style.top =
+        `${y}px`;
+
+
+      host.style.right =
+        "auto";
+    }
+  );
+
+
+  drag.addEventListener(
+    "pointerup",
+    () => {
+
+      dragging =
+        false;
+
+    }
+  );
+
+
+  drag.addEventListener(
+    "pointercancel",
+    () => {
+
+      dragging =
+        false;
+
+    }
+  );
+
+
+  /* ============================================================
+     DESTROY
+     ============================================================ */
+
+  function destroy() {
+
+    if (destroyed) {
+      return;
+    }
+
+
+    destroyed =
+      true;
+
+
+    clearAutoTimer();
+
+
+    if (scannerTimer) {
+
+      clearInterval(
+        scannerTimer
+      );
+    }
+
+
+    if (clockTimer) {
+
+      clearInterval(
+        clockTimer
+      );
+    }
+
+
+    if (temporaryStatusTimer) {
+
+      clearTimeout(
+        temporaryStatusTimer
+      );
+    }
+
+
+    if (observer) {
+
+      observer.disconnect();
+    }
+
+
+    host.remove();
+
+
+    delete window
+      .__STEPPUp;
+  }
+
+
+  $("close")
+    .addEventListener(
+      "click",
+      destroy
+    );
+
+
+  /* ============================================================
+     MANUAL CONSOLE COMMANDS
+     ============================================================ */
+
+  window.__STEPPUp = {
+
+    start:
+      startAuto,
+
+    pause:
+      pauseAuto,
+
+    next:
+      nextScreen,
+
+    mute:
+      toggleMute,
+
+    seek:
+      forceSeekToEnd,
+
+    scan:
+      scanInteractions,
+
+    destroy
+  };
+
+
+  /* ============================================================
+     STARTUP
+     ============================================================ */
+
+  updateSpeed();
+
+  scanInteractions();
+
+  renderStatus();
+
+
+  console.log(
+    "%cSTEPP Up loaded",
+    `
+      background:#202024;
+      color:#fff;
+      padding:6px 10px;
+      border-radius:8px;
+      font-weight:600;
+    `
+  );
+
+})();
