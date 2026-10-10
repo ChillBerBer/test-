@@ -1,0 +1,1008 @@
+(function () {
+    'use strict';
+
+    // ================= DOUBLE-PASTE GUARD =================
+    if (window.__clippy && typeof window.__clippy.destroy === 'function') {
+        try { window.__clippy.destroy(); } catch (e) {}
+    }
+
+    // ================= CONFIG =================
+    const DEFAULT_CONFIG = {
+        jkoSec: 3, jkoDelay: 2, jkoCycles: 20,
+        accent: '#00E676', widgetBg: 'rgba(243, 243, 243, 0.85)',
+        scale: 1, ghostOpacity: 0.15,
+        weatherUnit: 'F', weatherType: 'feels',
+        darkModeUI: true, darkModeBG: true,
+        saveEnabled: true, muted: false, showLocation: false,
+        version: 'V3',
+        julianDate: false, utcClock: false, autoCheck: false,
+        cdseSpeed: 2, speedTestBytes: 5000000, layout: 'auto',
+        hiddenCerts: {}, simpleMode: false, nightAuto: true, winW: 470, winH: 0
+    };
+
+    let state = {
+        isRunning: false, isPaused: false, mode: 'home', cycle: 0, failCount: 0,
+        uptimeStart: Date.now(), isGhost: false, isTurbo: false,
+        timer: null, nextCycle: null, audioCtx: null,
+        config: { ...DEFAULT_CONFIG },
+        isMinimized: false, isHidden: false, lastSpacePress: 0,
+        infoRemaining: 0, downMbps: 0, downAt: 0,
+        cdsePlaying: false, cdseBusy: false, cdsePresses: 0,
+        cdseInteractPaused: false, cdseX: false, cdseTimer: null,
+        testAt: {}, testMs: {}, closeArmed: false, clearArmed: false,
+        simpleMode: false, detected: 'none'
+    };
+
+    if (state.config.saveEnabled && localStorage.getItem('clippy_win11_config')) {
+        try { state.config = { ...DEFAULT_CONFIG, ...JSON.parse(localStorage.getItem('clippy_win11_config')) }; } catch (e) {}
+        state.config.hiddenCerts = state.config.hiddenCerts || {};
+    }
+    state.simpleMode = !!state.config.simpleMode;
+    const saveSettings = () => {
+        state.config.simpleMode = state.simpleMode;
+        if (state.config.saveEnabled) localStorage.setItem('clippy_win11_config', JSON.stringify(state.config));
+        else localStorage.removeItem('clippy_win11_config');
+    };
+
+    const intervals = [];
+    const track = (id) => { intervals.push(id); return id; };
+
+    // ================= SCORM (kept) =================
+    var API_1484_11 = null;
+    function initAPI2004() {
+        try {
+            API_1484_11 = window.frames["JKOAPI"].document.API_1484_11;
+            if (!API_1484_11) setTimeout(initAPI2004, 200);
+        } catch (e) { setTimeout(initAPI2004, 200); }
+    }
+    var jkoApiFrame = document.getElementById("JKOAPI");
+    if (jkoApiFrame) jkoApiFrame.onload = initAPI2004; else setTimeout(initAPI2004, 1000);
+
+    // ================= AUDIO (kept) =================
+    const playSound = (type) => {
+        if (state.config.muted) return;
+        try {
+            if (!state.audioCtx) state.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const osc = state.audioCtx.createOscillator(), gain = state.audioCtx.createGain();
+            osc.connect(gain); gain.connect(state.audioCtx.destination);
+            if (type === 'chime') {
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(523.25, state.audioCtx.currentTime);
+                osc.frequency.setValueAtTime(392.00, state.audioCtx.currentTime + 0.1);
+                gain.gain.setValueAtTime(0.5, state.audioCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.001, state.audioCtx.currentTime + 1.5);
+                osc.start(); osc.stop(state.audioCtx.currentTime + 1.5);
+            } else {
+                osc.type = 'square'; osc.frequency.value = 600;
+                gain.gain.setValueAtTime(0.1, state.audioCtx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.001, state.audioCtx.currentTime + 0.1);
+                osc.start(); osc.stop(state.audioCtx.currentTime + 0.1);
+            }
+        } catch (e) {}
+    };
+
+    // ================= HELPERS =================
+    let blinker = null;
+    const startBlink = () => { if (!blinker) blinker = setInterval(() => document.title = document.title.includes("✅") ? "Clippy.B" : "Completed ✅", 800); };
+    const stopBlink = () => { clearInterval(blinker); blinker = null; document.title = "Clippy.B"; };
+
+    const LOCATIONS = [
+        { bottom: '20px', left: '50%', transform: 'translateX(-50%) scale(var(--widget-scale))', top: 'auto', right: 'auto' },
+        { top: '20px', left: '20px', transform: 'none', bottom: 'auto', right: 'auto' },
+        { top: '20px', right: '20px', left: 'auto', transform: 'none', bottom: 'auto' },
+        { bottom: '20px', right: '20px', top: 'auto', left: 'auto', transform: 'none' },
+        { bottom: '20px', left: '20px', transform: 'none', top: 'auto', right: 'auto' }
+    ];
+    let currentLocationIndex = 0;
+
+    const isMac = /Mac|iPhone|iPad|iPod/.test(navigator.platform || navigator.userAgent);
+    const layoutMode = () => (state.config.layout === 'auto') ? (isMac ? 'mac' : 'win') : state.config.layout;
+
+    // ================= CERT DATA =================
+    const ATIS = 'https://learn.atis.army.mil/learning/course/index.php?mycards=0&filters%5Battributes%5D=&filters%5Blearningtemplate%5D=&filters%5Bcategoryid%5D=0&search=';
+    const JKO_MAIN = 'https://jkodirect.jten.mil/Atlas2/html/scorm2004/course/Course_main.jsp';
+    const CERTS = [
+        { name: 'Level 1 Antiterrorism',   url: JKO_MAIN },
+        { name: 'ATIS Dashboard',           url: 'https://atis.okta.mil/app/UserHome' },
+        { name: 'SERE',                     url: JKO_MAIN },
+        { name: 'OpSec',                    url: ATIS + 'OpSec' },
+        { name: 'DLIFLC',                   url: 'https://jkodirect.jten.mil/Atlas2/page/desktop/DesktopHome.jsf' },
+        { name: 'Cyber Awareness',          url: ATIS + 'Cyber+Awareness' },
+        { name: 'Security Training-Annual', url: ATIS + 'Security+Training' },
+        { name: 'InfoSec Program Training', url: ATIS + 'Security+Program+Training' },
+        { name: 'InfoSec',                  url: ATIS + 'Information+Security' },
+        { name: 'Tarp',                     url: ATIS + 'Tarp' },
+        { name: 'CDSE IF130.16',            url: 'https://securityawareness.dcsa.mil/disclosure/index.html' },
+        { name: 'CDSE IF141.16',            url: 'https://securityawareness.dcsa.mil/cui/index.html' },
+        { name: 'CDSE IF103.16',            url: 'https://securityawareness.dcsa.mil/derivative/index.htm' },
+        { name: 'Travel 101',               url: 'https://www.travel.dod.mil/Training/' }
+    ];
+    const visibleCerts = () => CERTS.map((c, i) => ({ c, i })).filter(o => !state.config.hiddenCerts[o.c.name]);
+
+    const LOG_KEY = 'clippy_win11_log';
+    const SESSION_KEY = 'clippy_win11_session';
+    const getLog = () => { try { return JSON.parse(localStorage.getItem(LOG_KEY) || '{}'); } catch (e) { return {}; } };
+    const setLog = (o) => localStorage.setItem(LOG_KEY, JSON.stringify(o));
+    const markDone = (name) => {
+        const log = getLog(); const now = Date.now();
+        log[name] = { doneAt: now, expiry: now + 1000 * 60 * 60 * 24 * 273 };
+        setLog(log); playSound('click'); renderAbout(); renderCerts(); renderCertFilter();
+    };
+    const ago = (t) => {
+        const d = Date.now() - t, day = Math.floor(d / 864e5);
+        if (day > 0) return day + 'd ago';
+        const h = Math.floor(d / 36e5); if (h > 0) return h + 'h ago';
+        return Math.floor(d / 6e4) + 'm ago';
+    };
+    const until = (t) => { const d = t - Date.now(); return d <= 0 ? 'expired' : Math.floor(d / 864e5) + 'd left'; };
+
+    // ================= DATE / TIME =================
+    const MONTHS = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+    const DAYS = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+    const FULLMONTHS = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+    const pad = (n, l = 2) => String(n).padStart(l, '0');
+    const dayOfYear = (d) => Math.floor((d - new Date(d.getFullYear(), 0, 0)) / 864e5);
+    const dateStr = (d) => `${pad(d.getDate())}${MONTHS[d.getMonth()]}${String(d.getFullYear()).slice(-2)}`;
+    const julianStr = (d) => `${String(d.getFullYear()).slice(-2)}${pad(dayOfYear(d), 3)}`;
+    const dateFootnote = (d) => `${DAYS[d.getDay()]}, ${FULLMONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}${state.config.julianDate ? ' (Julian YYDDD)' : ''}`;
+    const tzName = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (e) { return 'local'; } };
+    const tzOffset = () => { const o = -new Date().getTimezoneOffset() / 60; return 'UTC' + (o >= 0 ? '+' : '') + o; };
+    const tzFootnote = () => `Time zone: ${tzName()} (${tzOffset()}) · click toggles ${state.config.utcClock ? 'LOCAL' : 'UTC'}`;
+    const myDate = (t) => { const d = new Date(t); return `${MONTHS[d.getMonth()]} ${String(d.getFullYear()).slice(-2)}`; };
+    const mmss = (ms) => { const s = Math.floor(ms / 1000); return `${pad(Math.floor(s / 60))}:${pad(s % 60)}`; };
+
+    // ================= COLORS =================
+    const IDLE = '#808080';
+    const speedColor = (mbps) => {
+        if (!state.downAt || Date.now() - state.downAt > 3000) return IDLE;
+        if (mbps >= 10) return '#00E676';
+        if (mbps >= 2) return '#FFD54F';
+        return '#FF5252';
+    };
+    const mbpsColor = (m) => m >= 10 ? '#00E676' : (m >= 2 ? '#FFD54F' : '#FF5252');
+    const latColor = (ms) => ms == null ? IDLE : (ms >= 9999 ? '#FF5252' : (ms < 300 ? '#00E676' : (ms < 800 ? '#FFD54F' : '#FF5252')));
+    const BOX_FOOT = 'Click to test · green <300ms · yellow <800ms · red slow/down · resets to "test" after 5 min';
+
+    function initSpeed() {
+        try {
+            const po = new PerformanceObserver((list) => {
+                const e = list.getEntries().slice(-1)[0];
+                if (e && e.duration > 0 && e.transferSize > 0) {
+                    state.downMbps = (e.transferSize * 8) / (e.duration / 1000) / 1e6;
+                    state.downAt = Date.now();
+                }
+            });
+            po.observe({ entryTypes: ['resource'] });
+        } catch (e) {}
+        track(setInterval(renderSpeeds, 1000));
+        track(setInterval(expireBoxes, 15000));
+        track(setInterval(saveSession, 5000));
+    }
+    const renderSpeeds = () => {
+        const up = els.spdUp, down = els.spdDown; if (!up || !down) return;
+        up.style.color = IDLE; up.querySelector('b').innerText = '--';
+        down.style.color = speedColor(state.downMbps);
+        down.querySelector('b').innerText = (state.downAt && Date.now() - state.downAt <= 3000) ? state.downMbps.toFixed(1) : '--';
+    };
+
+    // ================= SESSION PERSIST =================
+    const saveSession = () => {
+        try { localStorage.setItem(SESSION_KEY, JSON.stringify({
+            mode: state.mode, running: state.isRunning, cdse: state.cdsePlaying,
+            cycle: state.cycle, presses: state.cdsePresses, info: state.infoRemaining, ts: Date.now()
+        })); } catch (e) {}
+    };
+    const loadSession = () => { try { return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch (e) { return null; } };
+
+    // ================= COURSE DETECT =================
+    const detectCourseType = () => {
+        try {
+            if (document.getElementsByName('courseheader').length) return 'jko';
+            if (document.querySelector('#seek') || document.querySelector('.left-ui-bg')) return 'cdse';
+            if (window.opener && window.opener.scorm) return 'opener';
+            if (window.frames['JKOAPI']) return 'jko';
+        } catch (e) {}
+        return 'none';
+    };
+
+    // ================= CSS =================
+    const css = `
+        :root{
+            --win-accent:${state.config.accent}; --win-bg:${state.config.widgetBg};
+            --win-text:#000; --win-text-sec:#5C5C5C; --win-border:rgba(0,0,0,.1);
+            --win-hover:rgba(0,0,0,.05); --win-active:rgba(0,0,0,.1); --win-shadow:0 2px 22px rgba(0,0,0,.15);
+            --widget-scale:${state.config.scale}; --ghost-opacity:${state.config.ghostOpacity};
+        }
+        .win-dark-ui{--win-bg:rgba(32,32,32,.9);--win-text:#fff;--win-text-sec:#ABABAB;--win-border:rgba(255,255,255,.1);--win-hover:rgba(255,255,255,.05);--win-active:rgba(255,255,255,.1);}
+        .win-dark-bg{background-color:#202020!important;color:#fff!important;}
+        #clippy-win11{position:fixed;width:470px;background:var(--win-bg);backdrop-filter:blur(20px) saturate(180%);
+            border:1px solid var(--win-border);border-radius:10px;box-shadow:var(--win-shadow);
+            font-family:'Segoe UI Variable','Segoe UI',sans-serif;color:var(--win-text);z-index:2147483647;
+            overflow:hidden;transition:opacity .2s,box-shadow .3s;top:auto;bottom:20px;left:50%;transform:translateX(-50%) scale(var(--widget-scale));}
+        #clippy-win11.hidden{display:none;}
+        #clippy-win11.ghost-mode{opacity:var(--ghost-opacity);} #clippy-win11.ghost-mode:hover{opacity:1;}
+        #clippy-tab{position:fixed;right:16px;bottom:16px;min-width:58px;height:36px;border-radius:18px;background:var(--win-bg);
+            border:1px solid var(--win-border);box-shadow:var(--win-shadow);display:none;align-items:center;justify-content:center;
+            font-size:12px;font-variant-numeric:tabular-nums;font-weight:700;cursor:pointer;z-index:2147483647;padding:0 10px;}
+        #clippy-tab.show{display:flex;}
+        .win-titlebar{height:34px;display:flex;align-items:center;gap:8px;padding:0 10px;cursor:move;font-size:12px;user-select:none;}
+        .hdr-date{font-weight:700;cursor:pointer;} .hdr-time{cursor:pointer;color:var(--win-text-sec);}
+        .hdr-min{margin:0 auto;cursor:pointer;padding:0 10px;color:var(--win-text-sec);}
+        .hdr-weather{cursor:pointer;} .hdr-a11y{cursor:pointer;font-size:14px;}
+        .hdr-close{width:22px;height:22px;border-radius:50%;border:none;background:#E53935;color:#000;font-weight:700;cursor:pointer;}
+        .win-body{padding:12px;display:flex;flex-direction:column;gap:8px;min-height:200px;overflow:auto;max-height:70vh;}
+        .status-card{background:var(--win-hover);border:1px solid var(--win-border);border-radius:6px;padding:12px;text-align:center;position:relative;overflow:hidden;}
+        #text-status{font-size:14px;font-weight:700;letter-spacing:1px;text-transform:uppercase;}
+        .status-progress-bg{position:absolute;left:0;bottom:0;height:3px;width:0;background:var(--win-accent);transition:width .2s;}
+        .win-btn{padding:6px 8px;border:1px solid var(--win-border);background:var(--win-hover);color:var(--win-text);border-radius:5px;font-size:12px;cursor:pointer;flex:1;}
+        .win-btn:hover{background:var(--win-active);} .btn-green{background:#2ecc71;color:#fff;border:none;} .btn-red{background:#e74c3c;color:#fff;border:none;}
+        .row{display:flex;gap:5px;align-items:center;}
+        .cert-head{display:flex;justify-content:space-between;align-items:center;font-size:11px;font-weight:700;color:var(--win-text-sec);margin-top:4px;}
+        .spd-inline{font-size:10px;color:var(--win-text-sec);margin:1px 0 3px;}
+        .cert-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px;}
+        .cert-item{display:flex;justify-content:space-between;align-items:center;font-size:11px;padding:4px 6px;background:var(--win-hover);border-radius:4px;}
+        .cert-item span.k{cursor:pointer;margin-left:3px;} .cert-item .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+        .tbox{border:1px solid var(--win-border);border-radius:3px;padding:0 4px;font-size:10px;cursor:pointer;color:${IDLE};min-width:26px;text-align:center;margin-left:4px;display:inline-block;}
+        .tbox:hover{background:var(--win-active);}
+        .cdate{font-size:10px;color:var(--win-text-sec);margin-left:4px;}
+        .cdate-btn{cursor:pointer;text-decoration:underline dotted;}
+        .cdate-btn:hover{color:var(--win-accent);}
+        .footnote{padding:5px 10px;font-size:10px;color:var(--win-text-sec);border-top:1px solid var(--win-border);min-height:16px;}
+        .dock{display:flex;align-items:center;justify-content:space-between;padding:5px 10px;border-top:1px solid var(--win-border);font-size:11px;}
+        .dock-nav{display:flex;gap:12px;} .dock-nav button{border:none;background:transparent;color:var(--win-text-sec);cursor:pointer;font-size:11px;font-weight:600;}
+        .dock-nav button.active{color:var(--win-accent);}
+        .spd b{font-weight:700;}
+        .page{display:none;} .page.active{display:block;}
+        #clippy-win11.minimized .win-body,#clippy-win11.minimized .footnote{display:none;}
+        .legend-item{display:flex;justify-content:space-between;font-size:11px;padding:2px 0;cursor:pointer;}
+        .about-head{font-weight:700;} .mono{font-family:ui-monospace,Consolas,monospace;}
+        #btn-os{flex:0 0 40px;font-size:14px;cursor:pointer;}
+        .num{width:72px;padding:4px;border:1px solid var(--win-border);border-radius:5px;background:transparent;color:var(--win-text);text-align:center;font-size:12px;}
+        .modal{position:absolute;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:20;}
+        .modal.show{display:flex;}
+        .modal-box{background:var(--win-bg);border:1px solid var(--win-border);border-radius:10px;padding:16px;text-align:center;max-width:320px;box-shadow:var(--win-shadow);}
+        .modal-box img{background:#fff;padding:6px;border-radius:6px;display:block;margin:0 auto;}
+        .cert-filter{max-height:150px;overflow:auto;font-size:11px;}
+        .cert-filter label{display:flex;justify-content:space-between;align-items:center;padding:2px 0;}
+        .wx-box{background:linear-gradient(160deg,#3a6ea5,#1b2735 70%);color:#fff;border:none;width:320px;border-radius:14px;}
+        .wx-box.night{background:linear-gradient(160deg,#1a2a4a,#0a0f18 70%);}
+        .wx-city{font-size:13px;opacity:.85;}
+        .wx-temp{font-size:56px;font-weight:200;line-height:1.05;letter-spacing:-2px;}
+        .wx-desc{font-size:13px;opacity:.9;margin-bottom:10px;}
+        .wx-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:11px;text-align:left;}
+        .wx-grid div{background:rgba(255,255,255,.14);border-radius:9px;padding:7px 9px;}
+        .wx-grid b{display:block;opacity:.7;font-weight:400;font-size:9px;}
+        .wx-alert{background:rgba(255,159,10,.22);border:1px solid rgba(255,159,10,.5);border-radius:9px;padding:6px 9px;font-size:11px;margin-bottom:8px;text-align:left;}
+        .wx-strip{display:flex;gap:6px;overflow-x:auto;margin:10px 0 6px;padding-bottom:4px;}
+        .wx-hour{flex:0 0 auto;background:rgba(255,255,255,.12);border-radius:9px;padding:6px 8px;font-size:10px;text-align:center;min-width:44px;}
+        .wx-daily{display:grid;gap:4px;font-size:11px;margin-top:6px;}
+        .wx-day{display:flex;justify-content:space-between;background:rgba(255,255,255,.1);border-radius:8px;padding:5px 9px;}
+        #resize-grip{position:absolute;right:0;bottom:0;width:16px;height:16px;cursor:nwse-resize;z-index:5;}
+        #resize-grip::after{content:'';position:absolute;right:3px;bottom:3px;width:8px;height:8px;border-right:2px solid var(--win-text-sec);border-bottom:2px solid var(--win-text-sec);opacity:.6;}
+        .sm-big{font-size:15px;padding:16px;font-weight:700;margin-bottom:8px;}
+        #clippy-win11.simple .dock-nav{display:none;}
+        #page-simple{display:none;}
+        #clippy-win11.simple #page-simple{display:block;}
+    `;
+    const styleTag = document.createElement('style'); styleTag.innerHTML = css; document.head.appendChild(styleTag);
+
+    // ================= HTML =================
+    const widget = document.createElement('div'); widget.id = 'clippy-win11';
+    widget.innerHTML = `
+        <div class="win-titlebar" id="drag-handle">
+            <span class="hdr-date" id="hdr-date">--</span>
+            <span class="hdr-time" id="hdr-time">--:--:--</span>
+            <span class="hdr-min" id="hdr-min" title="Minimize">⌄</span>
+            <span class="hdr-weather" id="hdr-weather" title="Click for full weather">☀️ --</span>
+            <span class="hdr-a11y" id="btn-a11y" title="Simple mode (accessibility)">♿</span>
+            <button class="hdr-close" id="btn-close" title="Stop scripts / press again to close">✕</button>
+        </div>
+
+        <div class="win-body">
+            <div class="page" id="page-simple">
+                <div class="status-card"><div id="text-status-simple">READY</div></div>
+                <div style="font-size:11px;color:var(--win-text-sec);text-align:center;">Detected: <b id="detected-type">--</b></div>
+                <button class="win-btn btn-green sm-big" id="sm-play">▶ Play</button>
+                <button class="win-btn btn-red sm-big" id="sm-stop">⏹ Stop</button>
+                <button class="win-btn sm-big" id="sm-runall">⚡ Run All</button>
+            </div>
+
+            <div class="page active" id="page-home">
+                <div class="status-card">
+                    <div id="text-status">READY</div>
+                    <div class="status-progress-bg" id="progress-bar"></div>
+                </div>
+
+                <div class="row">
+                    <button class="win-btn" id="btn-alms">ALMS/ATIS</button>
+                    <button class="win-btn" id="btn-opsec">OPSEC</button>
+                    <button class="win-btn" id="btn-infotarp">INFO/TARP</button>
+                    <button class="win-btn" id="btn-testjko">Test JKO</button>
+                </div>
+                <div class="row">
+                    <button class="win-btn btn-green" id="btn-start">Start Script</button>
+                    <button class="win-btn btn-red" id="btn-stop">Stop Script</button>
+                </div>
+                <div class="row">
+                    <button class="win-btn" id="btn-cdse">▶ CDSE</button>
+                    <input id="cdse-speed" class="num" type="number" min="1" max="999" step="1" value="${state.config.cdseSpeed}" title="CDSE delay: 1-59 = seconds, 60-999 = ms">
+                    <button class="win-btn" id="btn-os"></button>
+                </div>
+
+                <div class="cert-head"><span>Certifications</span><span id="btn-checkall" title="Scan speeds &amp; status">🛜</span></div>
+                <div class="spd-inline" id="spd-global">Net: -- · tap 🛜 to scan</div>
+                <div class="cert-grid" id="cert-grid"></div>
+            </div>
+
+            <div class="page" id="page-about">
+                <div class="about-head">Clippy.B by Hanbato <span style="color:var(--win-text-sec)">${state.config.version}</span></div>
+                <div class="row" style="margin:6px 0;">
+                    <button class="win-btn" id="btn-zelle">Zelle</button>
+                    <button class="win-btn" id="btn-cash">Cash App</button>
+                </div>
+                <div style="font-size:11px;font-weight:700;margin-top:6px;">Completed Log</div>
+                <div id="log-list" style="font-size:11px;"></div>
+                <div style="font-size:11px;font-weight:700;margin-top:6px;">Legend</div>
+                <div id="legend-list"></div>
+            </div>
+
+            <div class="page" id="page-settings">
+                <div class="row"><span style="flex:1;font-size:12px;">JKO Sec/Dly/Cyc</span>
+                    <input type="number" id="s-sec" class="num" style="width:40px" min="1" value="${state.config.jkoSec}">
+                    <input type="number" id="s-delay" class="num" style="width:40px" min="1" value="${state.config.jkoDelay}">
+                    <input type="number" id="s-cyc" class="num" style="width:40px" min="1" value="${state.config.jkoCycles}">
+                </div>
+                <div class="row" style="font-size:12px;"><span style="flex:1;">CDSE Speed (1-59s / 60-999ms)</span>
+                    <input type="number" id="s-cdsespd" class="num" min="1" max="999" step="1" value="${state.config.cdseSpeed}">
+                </div>
+                <div class="row" style="font-size:12px;"><span style="flex:1;">Shortcut Layout</span>
+                    <select id="s-layout"><option value="auto">Auto</option><option value="mac">Mac</option><option value="win">Windows</option></select>
+                </div>
+                <div class="row" style="font-size:12px;"><span style="flex:1;">Turbo</span><input type="checkbox" id="s-turbo"></div>
+                <div class="row" style="font-size:12px;"><span style="flex:1;">Weather °F / Feels</span>
+                    <select id="s-unit"><option value="F">°F</option><option value="C">°C</option></select>
+                    <select id="s-wtype"><option value="feels">Feels</option><option value="actual">Actual</option></select>
+                </div>
+                <div class="row" style="font-size:12px;"><span style="flex:1;">Accent</span><input type="color" id="s-color" value="${state.config.accent}"></div>
+                <div class="row" style="font-size:12px;"><span style="flex:1;">Dark UI</span><input type="checkbox" id="s-dark-ui" ${state.config.darkModeUI ? 'checked' : ''}></div>
+                <div class="row" style="font-size:12px;"><span style="flex:1;">Mute</span><input type="checkbox" id="s-mute" ${state.config.muted ? 'checked' : ''}></div>
+                <div class="row" style="font-size:12px;"><span style="flex:1;">Save</span><input type="checkbox" id="s-save" ${state.config.saveEnabled ? 'checked' : ''}></div>
+                <div style="font-size:11px;font-weight:700;margin-top:6px;">Show Certs <span style="font-weight:400;color:var(--win-text-sec)">(tap date = set now)</span></div>
+                <div class="cert-filter" id="cert-filter"></div>
+                <div class="row" style="font-size:12px;margin-top:6px;">
+                    <button class="win-btn" id="btn-clear-all">Clear All Dates</button>
+                    <button class="win-btn" id="btn-clear-select">Select to Clear</button>
+                </div>
+                <div class="row" style="font-size:12px;margin-top:6px;">
+                    <button class="win-btn" id="btn-selfcheck">Self-Check</button>
+                    <button class="win-btn" id="btn-export">Export</button>
+                    <button class="win-btn" id="btn-import">Import</button>
+                </div>
+                <input type="file" id="import-file" accept="application/json" style="display:none;">
+                <button class="win-btn" id="btn-reset">Reset Defaults</button>
+            </div>
+        </div>
+
+        <div class="footnote" id="footnote">Hover an item for info</div>
+
+        <div class="dock">
+            <span class="spd" id="spd-up">↑ <b>--</b></span>
+            <nav class="dock-nav">
+                <button data-page="about">About</button>
+                <button data-page="home" class="active">Home</button>
+                <button data-page="settings">Settings</button>
+            </nav>
+            <span class="spd" id="spd-down">↓ <b>--</b></span>
+        </div>
+
+        <div id="resize-grip" title="Drag to resize"></div>
+
+        <div class="modal" id="wx-modal">
+            <div class="modal-box wx-box" id="wx-box">
+                <div class="wx-city" id="wx-city">--</div>
+                <div class="wx-temp" id="wx-temp">--°</div>
+                <div class="wx-desc" id="wx-desc">--</div>
+                <div class="wx-alert" id="wx-alert" style="display:none;"></div>
+                <div class="wx-strip" id="wx-strip"></div>
+                <div class="wx-grid" id="wx-grid"></div>
+                <div class="wx-daily" id="wx-daily"></div>
+                <button class="win-btn" id="wx-close" style="margin-top:12px;">Close</button>
+            </div>
+        </div>
+
+        <div class="modal" id="qr-modal">
+            <div class="modal-box">
+                <div id="qr-title" style="font-weight:700;margin-bottom:8px;"></div>
+                <div id="qr-content"></div>
+                <button class="win-btn" id="qr-close" style="margin-top:12px;">Close</button>
+            </div>
+        </div>
+
+        <div class="modal" id="clear-modal">
+            <div class="modal-box">
+                <div style="font-weight:700;margin-bottom:8px;">Clear Cert Dates</div>
+                <div id="clear-list" style="max-height:230px;overflow:auto;text-align:left;"></div>
+                <div class="row" style="margin-top:10px;">
+                    <button class="win-btn" id="clear-selected">Clear Selected</button>
+                    <button class="win-btn" id="clear-close">Close</button>
+                </div>
+            </div>
+        </div>
+    `;
+    document.body.appendChild(widget);
+
+    const tab = document.createElement('div');
+    tab.id = 'clippy-tab'; tab.innerText = '00:00'; tab.title = 'Reopen Clippy.B (Ctrl+Shift+C)';
+    document.body.appendChild(tab);
+    tab.onclick = () => showWidget();
+
+    if (state.config.darkModeUI) widget.classList.add('win-dark-ui');
+    if (state.config.darkModeBG) document.body.classList.add('win-dark-bg');
+    if (state.config.winW) widget.style.width = state.config.winW + 'px';
+    if (state.config.winH) widget.style.height = state.config.winH + 'px';
+
+    // ================= ELEMENTS =================
+    const els = {
+        date: widget.querySelector('#hdr-date'), time: widget.querySelector('#hdr-time'),
+        weather: widget.querySelector('#hdr-weather'), footnote: widget.querySelector('#footnote'),
+        status: widget.querySelector('#text-status'), progress: widget.querySelector('#progress-bar'),
+        statusSimple: widget.querySelector('#text-status-simple'), detected: widget.querySelector('#detected-type'),
+        spdUp: widget.querySelector('#spd-up'), spdDown: widget.querySelector('#spd-down'),
+        certGrid: widget.querySelector('#cert-grid'), logList: widget.querySelector('#log-list'),
+        legendList: widget.querySelector('#legend-list'),
+        cdseSpeed: widget.querySelector('#cdse-speed'), cdseSpeedSet: widget.querySelector('#s-cdsespd')
+    };
+    const setFoot = (t) => els.footnote.innerText = t;
+    const setStatus = (t, p) => { els.status.innerText = t; els.statusSimple.innerText = t; if (p != null) els.progress.style.width = p + '%'; };
+
+    const showWidget = () => { widget.classList.remove('hidden'); tab.classList.remove('show'); state.isHidden = false; clampWidget(); };
+    const hideWidget = () => { widget.classList.add('hidden'); tab.classList.add('show'); state.isHidden = true; };
+    const toggleVisible = () => state.isHidden ? showWidget() : hideWidget();
+
+    const clampWidget = () => {
+        if (widget.classList.contains('hidden')) return;
+        const r = widget.getBoundingClientRect();
+        const maxL = Math.max(0, window.innerWidth - r.width);
+        const maxT = Math.max(0, window.innerHeight - r.height);
+        let l = r.left, t = r.top, changed = false;
+        if (l < 0) { l = 0; changed = true; }
+        if (t < 0) { t = 0; changed = true; }
+        if (l > maxL) { l = maxL; changed = true; }
+        if (t > maxT) { t = maxT; changed = true; }
+        if (changed) { widget.style.left = l + 'px'; widget.style.top = t + 'px'; widget.style.right = 'auto'; widget.style.bottom = 'auto'; widget.style.transform = 'scale(var(--widget-scale))'; }
+    };
+    window.addEventListener('resize', clampWidget);
+
+    const renderOs = () => {
+        const m = layoutMode();
+        const b = widget.querySelector('#btn-os');
+        b.innerText = m === 'mac' ? '🍎' : '🪟';
+        b.title = 'Shortcut layout: ' + m.toUpperCase() + ' (click to change)';
+    };
+    renderOs();
+
+    // ================= HEADER CLOCK =================
+    const renderClock = () => {
+        const d = new Date();
+        els.date.innerText = state.config.julianDate ? julianStr(d) : dateStr(d);
+        if (state.config.utcClock) els.time.innerText = `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} UTC`;
+        else els.time.innerText = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())} ${tzName().split('/').pop()}`;
+        tab.innerText = mmss(Date.now() - state.uptimeStart);
+    };
+    track(setInterval(renderClock, 1000)); renderClock();
+
+    // ================= WEATHER =================
+    let coords = null, wxData = {};
+    const getCoords = async () => {
+        if (coords) return coords;
+        try { const r = await fetch('https://ipapi.co/json/'); const j = await r.json(); if (j.latitude) coords = { lat: j.latitude, lon: j.longitude, city: j.city }; } catch (e) {}
+        return coords;
+    };
+    const WCODE = {0:['☀️','Clear'],1:['🌤️','Mostly Clear'],2:['⛅','Partly Cloudy'],3:['☁️','Overcast'],45:['🌫️','Fog'],48:['🌫️','Fog'],51:['🌦️','Drizzle'],53:['🌦️','Drizzle'],55:['🌦️','Drizzle'],61:['🌧️','Rain'],63:['🌧️','Rain'],65:['🌧️','Heavy Rain'],66:['🌧️','Freezing Rain'],67:['🌧️','Freezing Rain'],71:['🌨️','Snow'],73:['🌨️','Snow'],75:['🌨️','Heavy Snow'],77:['🌨️','Snow'],80:['🌦️','Showers'],81:['🌧️','Showers'],82:['⛈️','Heavy Showers'],85:['🌨️','Snow Showers'],86:['🌨️','Snow Showers'],95:['⛈️','Thunderstorm'],96:['⛈️','Thunderstorm'],99:['⛈️','Thunderstorm']};
+    const wIcon = (c) => (WCODE[c] || ['☀️',''])[0];
+    const wDesc = (c) => (WCODE[c] || ['','Clear'])[1];
+    const applyDayNight = () => {
+        const box = widget.querySelector('#wx-box'); if (!box) return;
+        const now = new Date();
+        const sr = wxData.sunrise ? new Date(wxData.sunrise) : null;
+        const ss = wxData.sunset ? new Date(wxData.sunset) : null;
+        const night = state.config.nightAuto && ((sr && now < sr) || (ss && now > ss));
+        box.classList.toggle('night', !!night);
+    };
+    const fallbackWeather = async () => {
+        try {
+            const r = await fetch('https://wttr.in/?format=j1'); const j = await r.json();
+            const c = j.current_condition[0], area = j.nearest_area[0];
+            const temp = state.config.weatherType === 'feels' ? (state.config.weatherUnit === 'F' ? c.FeelsLikeF : c.FeelsLikeC) : (state.config.weatherUnit === 'F' ? c.temp_F : c.temp_C);
+            const desc = c.weatherDesc[0].value.toLowerCase();
+            let icon = '☀️'; if (desc.includes('rain')) icon = '🌧️'; else if (desc.includes('cloud')) icon = '☁️';
+            wxData = { city: area.areaName[0].value, temp: Math.round(temp), feels: Math.round(c.FeelsLikeF), desc: c.weatherDesc[0].value, icon, humidity: c.humidity, wind: c.windspeedMiles + ' mph', uv: c.uvIndex, aqi: '--', rain: c.chanceofrain, sunrise: j.weather[0].astronomy[0].sunrise, sunset: j.weather[0].astronomy[0].sunset, unit: state.config.weatherUnit, hourly: [], daily: [], alert: '' };
+            els.weather.innerText = `${state.config.showLocation ? wxData.city + ' ' : ''}${icon} ${temp}°${state.config.weatherUnit}`;
+        } catch (e) { els.weather.innerText = '☀️ --'; }
+    };
+    const updateWeather = async () => {
+        const c = await getCoords();
+        if (!c) return fallbackWeather();
+        try {
+            const unit = state.config.weatherUnit === 'F' ? 'fahrenheit' : 'celsius';
+            const url = `https://api.open-meteo.com/v1/forecast?latitude=${c.lat}&longitude=${c.lon}&current=temperature_2m,apparent_temperature,weather_code,uv_index,relative_humidity_2m,wind_speed_10m&hourly=temperature_2m,weather_code,precipitation_probability&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset&timezone=auto&temperature_unit=${unit}&wind_speed_unit=mph&forecast_days=6`;
+            const j = await (await fetch(url)).json();
+            const cur = j.current, wc = WCODE[cur.weather_code] || ['☀️', 'Clear'];
+            const nowH = new Date().getHours();
+            const hourly = [];
+            for (let i = nowH; i < nowH + 12 && i < (j.hourly?.time?.length || 0); i++) {
+                hourly.push({ t: j.hourly.time[i].slice(11, 16), icon: wIcon(j.hourly.weather_code[i]), temp: Math.round(j.hourly.temperature_2m[i]), pop: j.hourly.precipitation_probability?.[i] ?? 0 });
+            }
+            const daily = [];
+            for (let i = 0; i < 5 && i < (j.daily?.time?.length || 0); i++) {
+                daily.push({ d: new Date(j.daily.time[i]).toLocaleDateString([], { weekday: 'short' }), icon: wIcon(j.daily.weather_code[i]), hi: Math.round(j.daily.temperature_2m_max[i]), lo: Math.round(j.daily.temperature_2m_min[i]), pop: j.daily.precipitation_probability_max?.[i] ?? 0 });
+            }
+            // derived alert
+            let alert = '';
+            const codes = (j.hourly?.weather_code || []).slice(nowH, nowH + 12);
+            if (codes.some(x => x >= 95)) alert = '⛈️ Thunderstorms expected in the next 12h';
+            else if (hourly.some(h => h.pop >= 60)) alert = '🌧️ High chance of rain soon';
+            else if (cur.temperature_2m >= 95) alert = '🥵 Heat advisory range';
+            else if (cur.temperature_2m <= 32) alert = '🥶 Freeze range';
+
+            wxData = { city: c.city, temp: Math.round(cur.temperature_2m), feels: Math.round(cur.apparent_temperature), desc: wc[1], icon: wc[0], humidity: cur.relative_humidity_2m, wind: Math.round(cur.wind_speed_10m) + ' mph', uv: cur.uv_index, aqi: '--', rain: j.hourly?.precipitation_probability?.[nowH] ?? '--', sunrise: j.daily?.sunrise?.[0], sunset: j.daily?.sunset?.[0], unit: state.config.weatherUnit, hourly, daily, alert };
+            els.weather.innerText = `${state.config.showLocation && c.city ? c.city + ' ' : ''}${wc[0]} ${wxData.temp}°${state.config.weatherUnit}`;
+            els.weather.dataset.rain = wxData.rain; els.weather.dataset.uv = wxData.uv;
+            try { const a = await (await fetch(`https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${c.lat}&longitude=${c.lon}&current=us_aqi`)).json(); wxData.aqi = a.current?.us_aqi ?? '--'; } catch (e) { wxData.aqi = '--'; }
+            applyDayNight();
+        } catch (e) { fallbackWeather(); }
+    };
+    updateWeather(); track(setInterval(updateWeather, 600000));
+
+    const showWx = () => {
+        if (wxData.temp == null) return;
+        applyDayNight();
+        widget.querySelector('#wx-city').innerText = (wxData.city || 'Current Location');
+        widget.querySelector('#wx-temp').innerText = `${wxData.temp}°`;
+        widget.querySelector('#wx-desc').innerText = `${wxData.icon || ''} ${wxData.desc || ''}`;
+        const al = widget.querySelector('#wx-alert');
+        if (wxData.alert) { al.style.display = 'block'; al.innerText = wxData.alert; } else al.style.display = 'none';
+        widget.querySelector('#wx-strip').innerHTML = (wxData.hourly || []).map(h => `<div class="wx-hour">${h.t}<div style="font-size:15px">${h.icon}</div>${h.temp}°<div style="opacity:.6">${h.pop}%</div></div>`).join('');
+        widget.querySelector('#wx-grid').innerHTML = `
+            <div><b>Feels Like</b>${wxData.feels}°${wxData.unit}</div>
+            <div><b>Humidity</b>${wxData.humidity}%</div>
+            <div><b>Wind</b>${wxData.wind}</div>
+            <div><b>UV Index</b>${wxData.uv}</div>
+            <div><b>Air Quality</b>${wxData.aqi}</div>
+            <div><b>Chance of Rain</b>${wxData.rain}%</div>`;
+        widget.querySelector('#wx-daily').innerHTML = (wxData.daily || []).map(d => `<div class="wx-day"><span>${d.d} ${d.icon}</span><span>${d.hi}° / ${d.lo}° · ${d.pop}%</span></div>`).join('');
+        widget.querySelector('#wx-modal').classList.add('show');
+    };
+    widget.querySelector('#wx-close').onclick = () => widget.querySelector('#wx-modal').classList.remove('show');
+
+    // ================= SIMPLE MODE =================
+    const updateDetected = () => { state.detected = detectCourseType(); els.detected.innerText = state.detected.toUpperCase(); };
+    const toggleSimple = () => {
+        state.simpleMode = !state.simpleMode;
+        widget.classList.toggle('simple', state.simpleMode);
+        pages.forEach(p => p.classList.remove('active'));
+        widget.querySelector(state.simpleMode ? '#page-simple' : '#page-home').classList.add('active');
+        widget.querySelector('#btn-a11y').style.color = state.simpleMode ? 'var(--win-accent)' : '';
+        saveSettings();
+        if (state.simpleMode) autoRunDetected();
+    };
+    const autoRunDetected = () => {
+        updateDetected();
+        if (!state.simpleMode) return;
+        if (state.detected === 'jko') runJKO();
+        else if (state.detected === 'cdse') startCdse();
+        else if (state.detected === 'opener') runOpsec();
+    };
+    widget.querySelector('#btn-a11y').onclick = toggleSimple;
+    widget.querySelector('#sm-play').onclick = () => { state.closeArmed = false; if (state.isPaused) { state.isPaused = false; cycleJKO(); } else if (!state.isRunning) autoRunDetected(); };
+    widget.querySelector('#sm-stop').onclick = () => { stopAll(); if (state.cdsePlaying) pauseCdse(); };
+    widget.querySelector('#sm-runall').onclick = () => { state.closeArmed = false; runAll(); };
+
+    // ================= CERT GRID =================
+    const setBox = (i, ms) => {
+        const el = els.certGrid.querySelector(`[data-tbox="${i}"]`);
+        if (!el) return;
+        if (ms == null) { el.innerText = 'test'; el.style.color = IDLE; }
+        else if (ms >= 9999) { el.innerText = 'down'; el.style.color = '#FF5252'; }
+        else { el.innerText = ms + 'ms'; el.style.color = latColor(ms); }
+    };
+    const renderCerts = () => {
+        const log = getLog();
+        els.certGrid.innerHTML = visibleCerts().map(({ c, i }) => {
+            const done = log[c.name]; const d = done ? myDate(done.expiry) : '—';
+            return `<div class="cert-item" data-i="${i}"><span class="nm">${c.name}</span><span>
+                <span class="cdate cdate-btn" data-upd="${c.name}" title="Click to set date to now">${d}</span>
+                <span class="k" data-act="link" title="Open link">🔗</span>
+                <span class="k" data-act="check" title="Check if down">🛜</span>
+                <span class="tbox" data-tbox="${i}" title="${BOX_FOOT}">test</span></span></div>`;
+        }).join('');
+        els.certGrid.querySelectorAll('.k').forEach(k => k.addEventListener('click', (e) => {
+            e.stopPropagation(); const i = +k.closest('.cert-item').dataset.i, c = CERTS[i];
+            if (k.dataset.act === 'link') window.open(c.url, '_blank');
+            if (k.dataset.act === 'check') checkSite(c.name, c.url, i);
+        }));
+        els.certGrid.querySelectorAll('[data-upd]').forEach(s => s.addEventListener('click', (e) => { e.stopPropagation(); markDone(s.dataset.upd); }));
+        els.certGrid.querySelectorAll('.tbox').forEach(b => {
+            b.addEventListener('click', (e) => { e.stopPropagation(); const i = +b.dataset.tbox; checkSite(CERTS[i].name, CERTS[i].url, i); });
+            b.addEventListener('mouseenter', () => setFoot(BOX_FOOT));
+        });
+        Object.keys(state.testAt).forEach(i => setBox(i, state.testMs[i]));
+    };
+    const expireBoxes = () => { Object.keys(state.testAt).forEach(i => { if (Date.now() - state.testAt[i] > 300000) { state.testMs[i] = null; setBox(i, null); } }); };
+    const checkSite = async (name, url, i) => {
+        setStatus('TEST ' + name.toUpperCase(), 40);
+        const t0 = performance.now();
+        try {
+            const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 6000);
+            await fetch(url, { mode: 'no-cors', cache: 'no-store', signal: ctrl.signal }); clearTimeout(t);
+            const ms = Math.max(1, Math.round(performance.now() - t0));
+            if (i != null) { state.testAt[i] = Date.now(); state.testMs[i] = ms; setBox(i, ms); }
+            setStatus(name.toUpperCase() + ' ' + ms + 'ms', 100); playSound('chime');
+        } catch (e) {
+            if (i != null) { state.testAt[i] = Date.now(); state.testMs[i] = 9999; setBox(i, 9999); }
+            setStatus(name.toUpperCase() + ' DOWN', 0);
+        }
+    };
+
+    // ================= NETWORK SCAN =================
+    const measureSpeed = async () => {
+        const url = `https://speed.cloudflare.com/__down?bytes=${state.config.speedTestBytes}`;
+        const t0 = performance.now(); const r = await fetch(url, { cache: 'no-store' }); const blob = await r.blob();
+        const secs = (performance.now() - t0) / 1000; return ((blob.size * 8) / secs) / 1e6;
+    };
+    const pingSite = async (url) => {
+        const t0 = performance.now(); const ctrl = new AbortController(); const to = setTimeout(() => ctrl.abort(), 8000);
+        try { await fetch(url, { mode: 'no-cors', cache: 'no-store', signal: ctrl.signal }); clearTimeout(to); return { ok: true, ms: Math.max(1, Math.round(performance.now() - t0)) }; }
+        catch (e) { clearTimeout(to); return { ok: false, ms: null }; }
+    };
+    const scanNetwork = async () => {
+        const g = widget.querySelector('#spd-global'); g.innerText = 'Net: measuring…'; setStatus('TEST GLOBAL', 5);
+        try { const mbps = await measureSpeed(); g.innerHTML = `Net: <b style="color:${mbpsColor(mbps)}">${mbps.toFixed(1)} Mbps</b>`; setStatus(`GLOBAL ${mbps.toFixed(1)} Mbps`, 10); } catch (e) { g.innerHTML = 'Net: <b style="color:#FF5252">failed</b>'; }
+        const list = visibleCerts();
+        for (let n = 0; n < list.length; n++) {
+            const { c, i } = list[n]; setStatus('TEST ' + c.name.toUpperCase(), 10 + (n / list.length) * 90);
+            const r = await pingSite(c.url); state.testAt[i] = Date.now(); state.testMs[i] = r.ok ? r.ms : 9999; setBox(i, state.testMs[i]);
+            setStatus(c.name.toUpperCase() + ' ' + (r.ok ? r.ms + 'ms' : 'DOWN'), 10 + ((n + 1) / list.length) * 90);
+        }
+        playSound('chime'); setStatus('SCAN DONE', 100);
+    };
+
+    // ================= SELF-CHECK =================
+    const selfCheck = () => {
+        const p = [];
+        p.push('API:' + (API_1484_11 ? 'YES' : 'no'));
+        p.push('JKOAPI-frame:' + (window.frames['JKOAPI'] ? 'YES' : 'no'));
+        p.push('courseheader:' + (document.getElementsByName('courseheader').length ? 'YES' : 'no'));
+        p.push('opener.scorm:' + (window.opener && window.opener.scorm ? 'YES' : 'no'));
+        p.push('seek:' + (document.querySelector('#seek') ? 'YES' : 'no'));
+        p.push('leftUI:' + (document.querySelector('.left-ui-bg') ? 'YES' : 'no'));
+        p.push('type:' + detectCourseType());
+        setStatus('SELF-CHECK', 100); setFoot(p.join(' · '));
+        playSound('chime');
+    };
+
+    // ================= ABOUT / LOG / LEGEND =================
+    const renderAbout = () => {
+        const log = getLog(); const keys = Object.keys(log);
+        els.logList.innerHTML = keys.length ? keys.map(n => `<div class="legend-item"><span>${n}</span><span class="mono">${myDate(log[n].expiry)} · ${ago(log[n].doneAt)}</span></div>`).join('') : '<div style="color:var(--win-text-sec)">no entries yet</div>';
+    };
+    const LEGEND = [['J','Run JKO'],['C','Run Cyber'],['O','Run Opsec'],['A','Run ALMS/ATIS'],['I','INFO/TARP'],['P','Pause/Resume'],['R','Reset cycles'],['K','Test API'],['S','Settings'],['L','Move widget'],['G','Ghost'],['T','Turbo'],['H','Home/Reset'],['^⇧C','Show/Hide']];
+    els.legendList.innerHTML = LEGEND.map(([k, v]) => `<div class="legend-item" data-k="${k}"><span><b>${k}</b></span><span style="color:var(--win-text-sec)">${v}</span></div>`).join('');
+    els.legendList.querySelectorAll('.legend-item').forEach(it => it.addEventListener('mouseenter', () => setFoot(it.dataset.k + ' — ' + it.querySelectorAll('span')[1].innerText)));
+    const renderCertFilter = () => {
+        const log = getLog();
+        widget.querySelector('#cert-filter').innerHTML = CERTS.map(c => {
+            const done = log[c.name]; const d = done ? myDate(done.expiry) : '—';
+            return `<label><span>${c.name} <span class="cdate cdate-btn" data-upd="${c.name}" title="Click to set date to now">${d}</span></span><input type="checkbox" data-cf="${c.name}" ${state.config.hiddenCerts[c.name] ? '' : 'checked'}></label>`;
+        }).join('');
+        widget.querySelectorAll('#cert-filter input').forEach(cb => cb.onchange = () => { if (cb.checked) delete state.config.hiddenCerts[cb.dataset.cf]; else state.config.hiddenCerts[cb.dataset.cf] = true; saveSettings(); renderCerts(); });
+        widget.querySelectorAll('#cert-filter [data-upd]').forEach(s => s.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); markDone(s.dataset.upd); }));
+    };
+
+    // ================= NAV =================
+    const pages = widget.querySelectorAll('.page');
+    widget.querySelectorAll('.dock-nav button').forEach(btn => btn.addEventListener('click', () => {
+        widget.querySelectorAll('.dock-nav button').forEach(b => b.classList.remove('active')); btn.classList.add('active');
+        pages.forEach(p => p.classList.remove('active')); widget.querySelector('#page-' + btn.dataset.page).classList.add('active');
+        if (btn.dataset.page === 'about') renderAbout(); playSound('click');
+    }));
+
+    // ================= RUN LOGIC =================
+    const complete = (t) => { setStatus(t, 100); playSound('chime'); startBlink(); widget.style.boxShadow = `0 0 25px 5px ${state.config.accent}`; state.isRunning = false; saveSession(); };
+    const stopAll = () => { clearTimeout(state.timer); clearTimeout(state.nextCycle); state.isRunning = false; state.isPaused = false; setStatus('STOPPED', 0); widget.style.boxShadow = 'var(--win-shadow)'; saveSession(); };
+
+    const runJKO = () => { state.mode = 'jko'; state.isRunning = true; state.cycle = 0; state.failCount = 0; setStatus('INIT', 0); playSound('click'); cycleJKO(); };
+    const cycleJKO = () => {
+        if (!state.isRunning || state.isPaused) return;
+        const max = parseInt(widget.querySelector('#s-cyc').value);
+        if (state.cycle >= max) { complete('J DONE'); return; }
+        setStatus('RUN', (state.cycle / max) * 100);
+        const t = state.isTurbo ? 800 : parseInt(widget.querySelector('#s-sec').value) * 1000;
+        const d = state.isTurbo ? 800 : parseInt(widget.querySelector('#s-delay').value) * 1000;
+        try {
+            const h = document.getElementsByName('courseheader');
+            if (h && h.length > 0) {
+                const doc = h[0].contentDocument || h[0].contentWindow.document;
+                const b = doc.getElementById('four');
+                if (b) {
+                    try { API_1484_11.SetValue('cmi.completion_status', 'completed'); API_1484_11.Commit(''); } catch (e) {}
+                    if (b.href.includes('javascript:')) h[0].contentWindow.location.href = b.href; else b.click();
+                    state.cycle++; setStatus(`CYC ${state.cycle}`, (state.cycle / max) * 100); saveSession();
+                } else state.failCount++;
+            }
+        } catch (e) { state.failCount++; }
+        if (state.failCount > 3) { setStatus('ERROR', 0); stopAll(); return; }
+        state.timer = setTimeout(() => { state.nextCycle = setTimeout(cycleJKO, d); }, t);
+    };
+    const runCyber = () => {
+        state.mode = 'cyber'; setStatus('SEARCH', 20);
+        let api = null, w = window;
+        while (w && !api) { if (w.API_1484_11) api = w.API_1484_11; else if (w.parent && w.parent !== w) w = w.parent; else if (w.opener) w = w.opener; else w = null; }
+        if (api) { setStatus('FOUND', 50); try { api.Initialize(''); api.SetValue('cmi.completion_status', 'completed'); api.SetValue('cmi.success_status', 'passed'); api.Commit(''); api.Terminate(''); complete('LEAVE'); } catch (e) { setStatus('ERROR', 0); } }
+        else setStatus('API FAIL', 0);
+    };
+    const runOpsec = () => {
+        state.mode = 'opsec'; setStatus('OPSEC', 50);
+        try {
+            if (window.opener && window.opener.scorm) { window.opener.scorm.set('cmi.score.raw', 100); window.opener.scorm.set('cmi.completion_status', 'completed'); window.opener.scorm.set('cmi.success_status', 'passed'); window.opener.scorm.commit(); complete('LEAVE'); }
+            else setStatus('NO OPEN', 0);
+        } catch (e) { setStatus('ERROR', 0); }
+    };
+    const runAlmsAtis = () => { stopAll(); runCyber(); setTimeout(runOpsec, 1500); };
+    const runAll = () => { stopAll(); runCyber(); setTimeout(runOpsec, 1200); setTimeout(runJKO, 2400); };
+    const runInfoTarp = () => {
+        stopAll(); state.isRunning = true; state.infoRemaining = 600;
+        const tick = () => { const m = pad(Math.floor(state.infoRemaining / 60)), s = pad(state.infoRemaining % 60); setStatus(`INFO/TARP ${m}:${s}`, ((600 - state.infoRemaining) / 600) * 100); if (state.infoRemaining <= 0) { complete('INFO/TARP DONE'); return; } state.infoRemaining--; state.timer = setTimeout(tick, 1000); };
+        tick();
+    };
+    const testAPI = () => { try { API_1484_11.SetValue('cmi.completion_status', 'completed'); setStatus('TEST OK', 100); playSound('chime'); } catch (e) { setStatus('NO API', 0); } };
+
+    // ================= CDSE ENGINE =================
+    const CDSE = { interactionSelector: '.left-ui-bg', seekSelector: '#seek', progressSelector: '#seek input[type="range"][data-ref="progressBar"]', interactionRenderDelay: 400, interactionResumeDelay: 1000, seekProcessingDelay: 300, searchAttempts: 12, searchDelay: 200 };
+    const handledInteractions = new WeakSet();
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const cdseMs = (raw) => { const n = parseInt(raw); if (!Number.isFinite(n) || n < 1) return 2000; if (n <= 59) return n * 1000; return Math.min(n, 5000); };
+    function getDocuments() {
+        const docs = []; const seen = new Set();
+        (function walk(doc) { if (!doc || seen.has(doc)) return; seen.add(doc); docs.push(doc); try { doc.querySelectorAll('iframe').forEach(f => { try { if (f.contentDocument) walk(f.contentDocument); } catch (_) {} }); } catch (_) {} })(document);
+        return docs;
+    }
+    function isVisible(el) { if (!el) return false; try { const r = el.getBoundingClientRect(); const win = el.ownerDocument?.defaultView || window; const s = win.getComputedStyle(el); return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden' && Number(s.opacity || 1) > 0; } catch (_) { return false; } }
+    function makeKeyEvent(type, key, code, keyCode) { const mac = layoutMode() === 'mac'; const e = new KeyboardEvent(type, { key, code, ctrlKey: true, altKey: !mac, metaKey: mac, shiftKey: false, bubbles: true, cancelable: true, composed: true }); try { Object.defineProperty(e, 'keyCode', { get: () => keyCode }); Object.defineProperty(e, 'which', { get: () => keyCode }); } catch (_) {} return e; }
+    function sendShortcut(key, code, keyCode) {
+        getDocuments().forEach(doc => {
+            const targets = [doc.activeElement, doc.body, doc.documentElement, doc].filter(Boolean);
+            targets.forEach(t => { try { t.dispatchEvent(makeKeyEvent('keydown', key, code, keyCode)); } catch (_) {} });
+            try { doc.defaultView?.dispatchEvent(makeKeyEvent('keydown', key, code, keyCode)); } catch (_) {}
+            setTimeout(() => { targets.forEach(t => { try { t.dispatchEvent(makeKeyEvent('keyup', key, code, keyCode)); } catch (_) {} }); try { doc.defaultView?.dispatchEvent(makeKeyEvent('keyup', key, code, keyCode)); } catch (_) {} }, 35);
+        });
+    }
+    function detectXOnPage() { let found = false; getDocuments().some(doc => { try { const els = doc.querySelectorAll('button,[role="button"],[aria-label],[title],[data-acc-text]'); for (const el of els) { if (!isVisible(el)) continue; const vals = [el.textContent, el.getAttribute('aria-label'), el.getAttribute('title'), el.getAttribute('data-acc-text')].filter(Boolean).map(v => v.trim().toLowerCase()); if (vals.some(v => v === 'x' || v === '×' || v === 'close' || v === 'close button')) { found = true; break; } } return found; } catch (_) { return false; } }); state.cdseX = found; return found; }
+    function nextScreen() { sendShortcut('.', 'Period', 190); }
+    function forceSeekToEnd() {
+        let found = false;
+        getDocuments().forEach(doc => {
+            try {
+                const seek = doc.querySelector(CDSE.seekSelector); const range = doc.querySelector(CDSE.progressSelector);
+                if (!seek || !range || !isVisible(seek)) return; found = true;
+                const max = Number(range.max); if (Number.isFinite(max)) { range.value = String(max); range.dispatchEvent(new Event('input', { bubbles: true })); range.dispatchEvent(new Event('change', { bubbles: true })); }
+                const rect = seek.getBoundingClientRect(); const x = rect.right - 3, y = rect.top + rect.height / 2;
+                const target = doc.elementFromPoint(x, y) || range; const view = doc.defaultView || window;
+                const down = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0, buttons: 1, view }; const up = { ...down, buttons: 0 };
+                target.dispatchEvent(new MouseEvent('mousemove', down)); target.dispatchEvent(new MouseEvent('mousedown', down)); target.dispatchEvent(new MouseEvent('mouseup', up)); target.dispatchEvent(new MouseEvent('click', up));
+            } catch (e) {}
+        });
+        return found;
+    }
+    function findAssociatedControl(bg) {
+        if (!bg) return null;
+        const sel = ['button', "[role='button']", 'a[href]', '[onclick]', "[tabindex='0']", '[data-acc-text]', '[data-ref]', '.slide-object'].join(',');
+        try { const c = bg.closest(sel); if (c && c !== bg && isVisible(c)) return c; } catch (_) {}
+        let container = bg;
+        for (let lvl = 0; lvl < 10 && container; lvl++) {
+            container = container.parentElement; if (!container) break;
+            try { if (container.matches(sel) && isVisible(container)) return container; } catch (_) {}
+            try { const cand = [...container.querySelectorAll(sel)].find(i => i !== bg && isVisible(i)); if (cand) return cand; } catch (_) {}
+        }
+        return null;
+    }
+    function simulateLeftClick(el) {
+        if (!el) return false;
+        try {
+            const rect = el.getBoundingClientRect(); const x = rect.left + rect.width / 2, y = rect.top + rect.height / 2; const win = el.ownerDocument?.defaultView || window;
+            const down = { bubbles: true, cancelable: true, clientX: x, clientY: y, button: 0, buttons: 1, view: win }; const up = { ...down, buttons: 0 };
+            el.dispatchEvent(new MouseEvent('mouseover', down)); el.dispatchEvent(new MouseEvent('mousedown', down)); el.dispatchEvent(new MouseEvent('mouseup', up)); el.dispatchEvent(new MouseEvent('click', up));
+            return true;
+        } catch (_) { return false; }
+    }
+    async function processInteraction(bg) {
+        if (handledInteractions.has(bg) || !isVisible(bg)) return;
+        handledInteractions.add(bg);
+        const resume = state.cdsePlaying; if (resume) state.cdseInteractPaused = true;
+        await sleep(CDSE.interactionRenderDelay);
+        let control = null;
+        for (let a = 0; a < CDSE.searchAttempts; a++) { control = findAssociatedControl(bg); if (control) break; await sleep(CDSE.searchDelay); }
+        if (!control) { state.cdseInteractPaused = resume; return; }
+        simulateLeftClick(control);
+        await sleep(CDSE.interactionResumeDelay);
+        if (resume && state.cdsePlaying) state.cdseInteractPaused = false;
+    }
+    function scanCdse() { if (!state.cdsePlaying) return; detectXOnPage(); getDocuments().forEach(doc => { try { doc.querySelectorAll(CDSE.interactionSelector).forEach(bg => { if (isVisible(bg) && !handledInteractions.has(bg)) processInteraction(bg); }); } catch (_) {} }); }
+    async function runCdseStep() {
+        if (!state.cdsePlaying || state.cdseBusy || state.cdseInteractPaused) return;
+        state.cdseBusy = true;
+        try {
+            scanCdse(); if (state.cdseInteractPaused) return;
+            forceSeekToEnd(); await sleep(CDSE.seekProcessingDelay);
+            scanCdse(); if (!state.cdsePlaying || state.cdseInteractPaused) return;
+            nextScreen(); state.cdsePresses++; setStatus(`CDSE ${state.cdsePresses}`, Math.min(100, state.cdsePresses * 2)); saveSession();
+        } finally { state.cdseBusy = false; }
+    }
+    function startCdse() { state.cdsePlaying = true; state.cdseInteractPaused = false; state.cdsePresses = 0; widget.querySelector('#btn-cdse').innerText = '⏸ CDSE'; playSound('click'); runCdseStep(); state.cdseTimer = setInterval(() => { scanCdse(); runCdseStep(); }, cdseMs(state.config.cdseSpeed)); saveSession(); }
+    function pauseCdse() { state.cdsePlaying = false; state.cdseInteractPaused = false; clearInterval(state.cdseTimer); widget.querySelector('#btn-cdse').innerText = '▶ CDSE'; setStatus('CDSE PAUSED', 0); saveSession(); }
+    const toggleCdse = () => { state.cdsePlaying ? pauseCdse() : startCdse(); };
+    const applyCdseSpeed = (val) => { let v = parseInt(val) || 2; v = Math.min(999, Math.max(1, v)); state.config.cdseSpeed = v; els.cdseSpeed.value = v; els.cdseSpeedSet.value = v; saveSettings(); if (state.cdsePlaying) { clearInterval(state.cdseTimer); state.cdseTimer = setInterval(() => { scanCdse(); runCdseStep(); }, cdseMs(v)); } };
+    els.cdseSpeed.onchange = (e) => applyCdseSpeed(e.target.value);
+    els.cdseSpeedSet.onchange = (e) => applyCdseSpeed(e.target.value);
+
+    // ================= CLEAR / EXPORT / IMPORT =================
+    widget.querySelector('#btn-clear-all').onclick = () => {
+        const b = widget.querySelector('#btn-clear-all');
+        if (!state.clearArmed) { state.clearArmed = true; b.innerText = 'Confirm?'; b.style.color = '#FF5252'; return; }
+        localStorage.removeItem(LOG_KEY); renderAbout(); renderCerts(); renderCertFilter(); playSound('click');
+        state.clearArmed = false; b.innerText = 'Clear All Dates'; b.style.color = '';
+    };
+    const openClearModal = () => {
+        const log = getLog();
+        widget.querySelector('#clear-list').innerHTML = CERTS.map((c, i) => `<label class="legend-item"><span>${c.name} <span class="cdate">${log[c.name] ? myDate(log[c.name].expiry) : '—'}</span></span><input type="checkbox" data-ci="${i}" ${log[c.name] ? '' : 'disabled'}></label>`).join('');
+        widget.querySelector('#clear-modal').classList.add('show');
+    };
+    widget.querySelector('#btn-clear-select').onclick = openClearModal;
+    widget.querySelector('#clear-close').onclick = () => widget.querySelector('#clear-modal').classList.remove('show');
+    widget.querySelector('#clear-selected').onclick = () => { const log = getLog(); widget.querySelectorAll('#clear-list input:checked').forEach(cb => { delete log[CERTS[+cb.dataset.ci].name]; }); setLog(log); renderAbout(); renderCerts(); renderCertFilter(); widget.querySelector('#clear-modal').classList.remove('show'); playSound('click'); };
+
+    widget.querySelector('#btn-selfcheck').onclick = selfCheck;
+    widget.querySelector('#btn-export').onclick = () => {
+        const data = { config: state.config, log: getLog() };
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'clippy-backup.json'; a.click();
+        playSound('click');
+    };
+    widget.querySelector('#btn-import').onclick = () => widget.querySelector('#import-file').click();
+    widget.querySelector('#import-file').onchange = (e) => {
+        const f = e.target.files[0]; if (!f) return;
+        const r = new FileReader();
+        r.onload = () => { try { const d = JSON.parse(r.result); if (d.config) { state.config = { ...DEFAULT_CONFIG, ...d.config }; saveSettings(); } if (d.log) setLog(d.log); renderAbout(); renderCerts(); renderCertFilter(); setStatus('IMPORTED', 100); } catch (err) { setStatus('IMPORT FAIL', 0); } };
+        r.readAsText(f); e.target.value = '';
+    };
+
+    // ================= QR =================
+    const showQR = (title, url, msg) => {
+        widget.querySelector('#qr-title').innerText = title;
+        widget.querySelector('#qr-content').innerHTML = url
+            ? `<img src="https://api.qrserver.com/v1/create-qr-code/?size=180x180&margin=8&data=${encodeURIComponent(url)}" width="180" height="180" alt="QR"><div style="font-size:10px;margin-top:6px;color:var(--win-text-sec);word-break:break-all;">${url}</div>`
+            : `<div style="font-size:12px;padding:22px 6px;">${msg}</div>`;
+        widget.querySelector('#qr-modal').classList.add('show');
+    };
+    widget.querySelector('#qr-close').onclick = () => widget.querySelector('#qr-modal').classList.remove('show');
+
+    // ================= BINDINGS =================
+    widget.querySelector('#btn-alms').onclick = () => { state.closeArmed = false; runAlmsAtis(); };
+    widget.querySelector('#btn-opsec').onclick = () => { state.closeArmed = false; stopAll(); runOpsec(); };
+    widget.querySelector('#btn-infotarp').onclick = () => { state.closeArmed = false; runInfoTarp(); };
+    widget.querySelector('#btn-testjko').onclick = testAPI;
+    widget.querySelector('#btn-start').onclick = () => { state.closeArmed = false; if (state.isPaused) { state.isPaused = false; cycleJKO(); } else if (!state.isRunning) runJKO(); };
+    widget.querySelector('#btn-stop').onclick = stopAll;
+    widget.querySelector('#btn-cdse').onclick = () => { state.closeArmed = false; toggleCdse(); };
+    widget.querySelector('#btn-os').onclick = () => { const order = ['auto', 'mac', 'win']; state.config.layout = order[(order.indexOf(state.config.layout) + 1) % order.length]; saveSettings(); renderOs(); widget.querySelector('#s-layout').value = state.config.layout; };
+    widget.querySelector('#btn-close').onclick = () => {
+        if (!state.closeArmed) { state.closeArmed = true; stopAll(); if (state.cdsePlaying) pauseCdse(); clearInterval(state.cdseTimer); setStatus('STOPPED — ✕ again to close', 0); widget.querySelector('#btn-close').title = 'Press again to close'; }
+        else hideWidget();
+    };
+    widget.querySelector('#hdr-min').onclick = () => { state.isMinimized = !state.isMinimized; widget.classList.toggle('minimized', state.isMinimized); clampWidget(); };
+    widget.querySelector('#hdr-date').onclick = () => { state.config.julianDate = !state.config.julianDate; renderClock(); saveSettings(); };
+    widget.querySelector('#hdr-time').onclick = () => { state.config.utcClock = !state.config.utcClock; renderClock(); saveSettings(); };
+    widget.querySelector('#hdr-weather').onclick = showWx;
+    widget.querySelector('#hdr-weather').onmouseenter = () => setFoot(`Rain: ${els.weather.dataset.rain || '--'}% · AQI: ${wxData.aqi || '--'} · UV: ${wxData.uv || '--'}`);
+    widget.querySelector('#btn-zelle').onclick = () => showQR('Zelle', null, 'Sorry — QR not found right now. In progress, thank you!');
+    widget.querySelector('#btn-cash').onclick = () => { window.open('https://cash.app/$Hanbato', '_blank'); showQR('Cash App', 'https://cash.app/$Hanbato'); };
+    widget.querySelector('#btn-checkall').onclick = scanNetwork;
+    widget.querySelector('#hdr-min').onmouseenter = () => setFoot('Click for minimize mode');
+    widget.querySelector('#hdr-date').onmouseenter = () => setFoot(dateFootnote(new Date()));
+    widget.querySelector('#hdr-time').onmouseenter = () => setFoot(tzFootnote());
+    widget.querySelector('#btn-a11y').onmouseenter = () => setFoot('Simple mode — auto-detects course & runs');
+    widget.querySelector('#btn-close').onmouseenter = () => setFoot('First press stops scripts · second press closes (Ctrl+Shift+C toggles)');
+    widget.querySelector('#spd-up').onmouseenter = () => setFoot('Upload speed (N/A)');
+    widget.querySelector('#spd-down').onmouseenter = () => setFoot('Live download speed (dim = idle)');
+    els.cdseSpeed.onmouseenter = () => setFoot('CDSE delay — type 1-59 = seconds, 60-999 = milliseconds');
+
+    // ================= SETTINGS =================
+    widget.querySelector('#s-sec').onchange = e => { state.config.jkoSec = Math.max(1, +e.target.value); saveSettings(); };
+    widget.querySelector('#s-delay').onchange = e => { state.config.jkoDelay = Math.max(1, +e.target.value); saveSettings(); };
+    widget.querySelector('#s-cyc').onchange = e => { state.config.jkoCycles = Math.max(1, +e.target.value); saveSettings(); };
+    widget.querySelector('#s-layout').value = state.config.layout;
+    widget.querySelector('#s-layout').onchange = e => { state.config.layout = e.target.value; saveSettings(); renderOs(); };
+    widget.querySelector('#s-turbo').onchange = e => { state.isTurbo = e.target.checked; saveSettings(); };
+    widget.querySelector('#s-color').oninput = e => { state.config.accent = e.target.value; document.documentElement.style.setProperty('--win-accent', e.target.value); saveSettings(); };
+    widget.querySelector('#s-dark-ui').onchange = e => { state.config.darkModeUI = e.target.checked; widget.classList.toggle('win-dark-ui', e.target.checked); saveSettings(); };
+    widget.querySelector('#s-mute').onchange = e => { state.config.muted = e.target.checked; saveSettings(); };
+    widget.querySelector('#s-save').onchange = e => { state.config.saveEnabled = e.target.checked; saveSettings(); };
+    widget.querySelector('#s-unit').onchange = e => { state.config.weatherUnit = e.target.value; saveSettings(); updateWeather(); };
+    widget.querySelector('#s-wtype').onchange = e => { state.config.weatherType = e.target.value; saveSettings(); updateWeather(); };
+    widget.querySelector('#btn-reset').onclick = () => { localStorage.removeItem('clippy_win11_config'); localStorage.removeItem(SESSION_KEY); location.reload(); };
+
+    // ================= HOTKEYS =================
+    function keyHandler(e) {
+        if (e.ctrlKey && e.shiftKey && e.key.toUpperCase() === 'C') { e.preventDefault(); toggleVisible(); return; }
+        if (document.activeElement.tagName === 'INPUT' || document.activeElement.tagName === 'SELECT') return;
+        const k = e.key.toUpperCase();
+        if (k === 'J') { stopAll(); runJKO(); }
+        if (k === 'C') { stopAll(); runCyber(); }
+        if (k === 'O') { stopAll(); runOpsec(); }
+        if (k === 'A') { runAlmsAtis(); }
+        if (k === 'I') { runInfoTarp(); }
+        if (k === 'P') { if (state.mode === 'jko') { state.isPaused = !state.isPaused; setStatus(state.isPaused ? 'PAUSED' : 'RUNNING', 50); if (!state.isPaused) cycleJKO(); } }
+        if (k === 'R') { state.cycle = 0; setStatus('RESET', 0); }
+        if (k === 'K') { testAPI(); }
+        if (k === 'S') { widget.querySelector('.dock-nav button[data-page="settings"]').click(); }
+        if (k === 'L') { currentLocationIndex = (currentLocationIndex + 1) % LOCATIONS.length; widget.style.top = widget.style.bottom = widget.style.left = widget.style.right = ''; widget.style.transform = ''; Object.assign(widget.style, LOCATIONS[currentLocationIndex]); clampWidget(); }
+        if (k === 'G') { state.isGhost = !state.isGhost; widget.classList.toggle('ghost-mode', state.isGhost); }
+        if (k === 'T') { state.isTurbo = !state.isTurbo; widget.querySelector('#s-turbo').checked = state.isTurbo; setStatus(state.isTurbo ? 'TURBO' : 'NORMAL', 50); }
+        if (k === 'H') { stopAll(); state.cycle = 0; setStatus('HOME', 0); widget.style.boxShadow = 'var(--win-shadow)'; stopBlink(); }
+    }
+    document.addEventListener('keydown', keyHandler);
+
+    // ================= DRAG + RESIZE =================
+    let isDragging = false, off = { x: 0, y: 0 };
+    widget.querySelector('#drag-handle').addEventListener('mousedown', (e) => {
+        if (e.target.closest('button') || e.target.closest('input') || e.target.classList.contains('hdr-min')) return;
+        isDragging = true; off.x = e.clientX; off.y = e.clientY;
+        const r = widget.getBoundingClientRect(); widget.style.left = r.left + 'px'; widget.style.top = r.top + 'px'; widget.style.right = widget.style.bottom = 'auto'; widget.style.transform = 'scale(var(--widget-scale))';
+    });
+    document.addEventListener('mousemove', (e) => {
+        if (!isDragging) return;
+        widget.style.left = (widget.offsetLeft + (e.clientX - off.x)) + 'px'; widget.style.top = (widget.offsetTop + (e.clientY - off.y)) + 'px';
+        off.x = e.clientX; off.y = e.clientY; clampWidget();
+    });
+    document.addEventListener('mouseup', () => isDragging = false);
+
+    let rz = false, rzX = 0, rzY = 0, rzW = 0, rzH = 0;
+    widget.querySelector('#resize-grip').addEventListener('mousedown', (e) => {
+        rz = true; rzX = e.clientX; rzY = e.clientY; const r = widget.getBoundingClientRect(); rzW = r.width; rzH = r.height;
+        e.stopPropagation(); e.preventDefault();
+    });
+    document.addEventListener('mousemove', (e) => {
+        if (!rz) return;
+        const w = Math.max(320, rzW + (e.clientX - rzX)), h = Math.max(160, rzH + (e.clientY - rzY));
+        widget.style.width = w + 'px'; widget.style.height = h + 'px'; state.config.winW = w; state.config.winH = h;
+    });
+    document.addEventListener('mouseup', () => { if (rz) { rz = false; saveSettings(); clampWidget(); } });
+
+    // ================= DESTROY =================
+    function destroy() {
+        try { intervals.forEach(clearInterval); } catch (e) {}
+        clearTimeout(state.timer); clearTimeout(state.nextCycle);
+        try { clearInterval(state.cdseTimer); } catch (e) {}
+        document.removeEventListener('keydown', keyHandler);
+        window.removeEventListener('resize', clampWidget);
+        try { widget.remove(); } catch (e) {}
+        try { tab.remove(); } catch (e) {}
+        try { styleTag.remove(); } catch (e) {}
+        delete window.__clippy;
+    }
+    window.__clippy = { destroy, version: state.config.version };
+
+    // ================= INIT + RESUME =================
+    renderCerts(); renderAbout(); renderCertFilter(); initSpeed(); updateDetected();
+    if (state.simpleMode) toggleSimple();
+    const sess = loadSession();
+    if (sess && Date.now() - sess.ts < 6 * 3600e3) {
+        setTimeout(() => {
+            if (sess.cdse) startCdse();
+            else if (sess.mode === 'jko' && sess.running) runJKO();
+            else if (state.simpleMode) autoRunDetected();
+            else if (sess.mode === 'opsec' && sess.running) runOpsec();
+        }, 1500);
+    }
+    console.log('%cClippy.B ' + state.config.version, 'background:#202024;color:#fff;padding:6px 10px;border-radius:8px;font-weight:600;');
+})();
